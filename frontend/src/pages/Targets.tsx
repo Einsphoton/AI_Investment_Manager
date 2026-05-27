@@ -1,0 +1,911 @@
+import { useState, useEffect, useCallback, useRef } from 'react'
+import {
+  Card, Table, Button, Modal, Form, Input, Select, Space,
+  Tag, message, Row, Col, Typography, Tooltip, Popconfirm, Popover,
+  Radio, Spin
+} from 'antd'
+import {
+  PlusOutlined, DeleteOutlined, BulbOutlined,
+  RobotOutlined, ThunderboltOutlined, AimOutlined,
+  StarOutlined, StarFilled, InfoCircleOutlined,
+  FundOutlined, LineChartOutlined, GlobalOutlined,
+  ThunderboltFilled, ExperimentOutlined, ClearOutlined,
+  WarningOutlined, BarChartOutlined
+} from '@ant-design/icons'
+
+import { targetsApi, marketApi, settingsApi, Target, MarketHistoryItem } from '../api'
+
+const { Text } = Typography
+
+const goldStyle = { color: '#c9a84c' }
+const priorityColors: Record<string, string> = {
+  HIGH: '#c9a84c', MEDIUM: '#e8d48b', LOW: '#a0893c',
+}
+const riskColors: Record<string, string> = {
+  HIGH: '#cf1322', MEDIUM: '#c9a84c', LOW: '#3f8600',
+}
+const sourceLabels: Record<string, string> = { manual: '手动添加', ai_recommended: 'AI 推荐' }
+
+const marketFilterOptions = [
+  { label: '全部市场', value: '' },
+  { label: 'A 股', value: 'A' },
+  { label: '港股', value: 'HK' },
+  { label: '美股', value: 'US' },
+]
+
+const assetTypeFilterOptions = [
+  { label: '全部类型', value: '' },
+  { label: '股票', value: 'stock' },
+  { label: '场内基金', value: 'onshore_fund' },
+  { label: '场外基金', value: 'offshore_fund' },
+]
+
+const sourceFilterOptions = [
+  { label: '全部来源', value: '' },
+  { label: '手动添加', value: 'manual' },
+  { label: 'AI 推荐', value: 'ai_recommended' },
+]
+
+const groupByOptions = [
+  { label: '不分组', value: 'none' },
+  { label: '按类型', value: 'asset_type' },
+  { label: '按来源', value: 'source' },
+  { label: '按市场', value: 'market' },
+]
+
+const groupLabels: Record<string, Record<string, string>> = {
+  asset_type: { stock: '股票', offshore_fund: '场外基金', onshore_fund: '场内基金' },
+  source: { manual: '手动添加', ai_recommended: 'AI 推荐' },
+  market: { A: 'A 股', HK: '港股', US: '美股' },
+}
+
+const assetTypeMap: Record<string, string> = {
+  stock: '股票', offshore_fund: '场外基金', onshore_fund: '场内基金',
+}
+
+const marketColors: Record<string, string> = { A: '#c9a84c', HK: '#e8d48b', US: '#a0893c' }
+
+const chartCache = new Map<number, MarketHistoryItem[]>()
+const chartRequestCache = new Map<number, Promise<MarketHistoryItem[]>>()
+const fundaCache = new Map<number, any>()
+const fundaRequestCache = new Map<number, Promise<any>>()
+
+const fundamentalGroups: { label: string; keys: string[] }[] = [
+  { label: '估值', keys: ['trailing_pe', 'forward_pe', 'price_to_book'] },
+  { label: '分红', keys: ['dividend_yield', 'dividend_rate', 'payout_ratio'] },
+  { label: '盈利能力', keys: ['eps', 'profit_margins', 'operating_margins', 'return_on_equity', 'return_on_assets'] },
+  { label: '成长性', keys: ['revenue_growth', 'earnings_growth'] },
+  { label: '财务健康', keys: ['debt_to_equity', 'current_ratio', 'quick_ratio', 'beta', 'book_value'] },
+  { label: '规模', keys: ['market_cap', 'revenue', 'shares_outstanding'] },
+]
+
+const fundamentalLabels: Record<string, string> = {
+  trailing_pe: '市盈率 (TTM)', forward_pe: '远期市盈率',
+  price_to_book: '市净率', dividend_yield: '股息率',
+  dividend_rate: '每股股息/分红', payout_ratio: '派息率',
+  eps: '每股收益', book_value: '每股净资产',
+  market_cap: '总市值', beta: 'Beta 系数',
+  revenue: '营业收入', revenue_growth: '营收增长率',
+  profit_margins: '利润率', operating_margins: '营业利润率',
+  return_on_equity: '净资产收益率 (ROE)',
+  return_on_assets: '总资产收益率 (ROA)',
+  debt_to_equity: '资产负债率', current_ratio: '流动比率',
+  quick_ratio: '速动比率', earnings_growth: '盈利增长率',
+  shares_outstanding: '总股本', short_ratio: '做空比率',
+}
+
+const fundamentalUnits: Record<string, string> = {
+  trailing_pe: '倍', forward_pe: '倍',
+  price_to_book: '倍', dividend_yield: '%',
+  dividend_rate: '元/股', payout_ratio: '%',
+  eps: '元', book_value: '元',
+  market_cap: '亿', beta: '',
+  revenue: '亿', revenue_growth: '%',
+  profit_margins: '%', operating_margins: '%',
+  return_on_equity: '%', return_on_assets: '%',
+  debt_to_equity: '%', current_ratio: '',
+  quick_ratio: '', earnings_growth: '%',
+  shares_outstanding: '亿', short_ratio: '%',
+}
+
+function formatFundamental(value: any, key: string): string {
+  if (value == null) return '-'
+  let num = typeof value === 'number' ? value : parseFloat(value)
+  if (isNaN(num)) return String(value)
+  if (['market_cap', 'revenue', 'shares_outstanding'].includes(key)) {
+    num = num / 1e8
+  }
+  if (['dividend_yield', 'payout_ratio', 'revenue_growth', 'profit_margins',
+       'return_on_equity', 'return_on_assets', 'operating_margins',
+       'earnings_growth', 'short_ratio'].includes(key)) {
+    num = num * 100
+  }
+  const unit = fundamentalUnits[key] || ''
+  if (num > 10000) return (num / 10000).toFixed(2) + '万亿'
+  if (num < 0.01 && unit === '倍') return num.toFixed(2) + unit
+  if (num < 0.01) return num.toFixed(4) + unit
+  if (num < 1) return num.toFixed(3) + unit
+  return num.toFixed(2) + unit
+}
+
+function FundamentalsDisplay({ data, loading }: { data: Record<string, any>, loading?: boolean }) {
+  const available = fundamentalGroups.filter(g => g.keys.some(k => data[k] != null))
+  const hasAny = available.length > 0
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <Space style={{ marginBottom: 8 }}>
+        <BarChartOutlined style={{ color: '#c9a84c', fontSize: 12 }} />
+        <Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>基本面指标</Text>
+        {loading && <Spin size="small" />}
+        {!loading && !hasAny && <Text style={{ color: '#5c5a55', fontSize: 11 }}>（暂无数据）</Text>}
+      </Space>
+      {loading && !hasAny && (
+        <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(26, 26, 36, 0.3)', border: '1px solid rgba(255,255,255,0.04)' }}>
+          <Text style={{ color: '#9a9892', fontSize: 11 }}>正在加载基本面指标...</Text>
+        </div>
+      )}
+      {!loading && !hasAny && (
+        <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(26, 26, 36, 0.3)', border: '1px solid rgba(255,255,255,0.04)' }}>
+          <Text style={{ color: '#5c5a55', fontSize: 11 }}>该标的基本面数据暂不可用，请检查数据源配置或稍后重试</Text>
+        </div>
+      )}
+      {available.map(group => (
+        <div key={group.label} style={{ marginBottom: 8, padding: '8px 10px', borderRadius: 8, background: 'rgba(26, 26, 36, 0.5)', border: '1px solid rgba(255,255,255,0.04)' }}>
+          <Text style={{ color: '#c9a84c', fontSize: 10, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 6, display: 'block' }}>{group.label}</Text>
+          <div>
+            {group.keys.map(k => {
+              if (data[k] == null) return null
+              return (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                  <span style={{ color: '#9a9892', fontSize: 11 }}>{fundamentalLabels[k] || k}</span>
+                  <span style={{ color: '#e8e6e3', fontSize: 11, fontWeight: 500, fontFamily: 'monospace' }}>{formatFundamental(data[k], k)}</span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function KLineChart({ data }: { data: MarketHistoryItem[] }) {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null)
+
+  if (!data.length) return null
+
+  const isUp = data[data.length - 1]?.price >= data[0]?.price
+  const chartColor = isUp ? '#3f8600' : '#cf1322'
+  const minP = Math.min(...data.map(d => d.low ?? d.price))
+  const maxP = Math.max(...data.map(d => d.high ?? d.price))
+  const pad = (maxP - minP) * 0.08 || maxP * 0.02
+  const yMin = minP - pad
+  const yMax = maxP + pad
+  const yRange = yMax - yMin || 1
+
+  const margin = { top: 5, right: 5, bottom: 20, left: 55 }
+  const svgW = 420
+  const chartW = svgW - margin.left - margin.right
+  const chartH = 180 - margin.top - margin.bottom
+
+  const xScale = (i: number) => margin.left + (i / Math.max(1, data.length - 1)) * chartW
+  const yScale = (v: number) => margin.top + (1 - (v - yMin) / yRange) * chartH
+
+  const candleW = Math.max(2, Math.min(8, chartW / data.length - 1))
+
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = (e.clientX - rect.left) / rect.width * svgW
+    const idx = Math.round((x - margin.left) / chartW * (data.length - 1))
+    setHoverIdx(Math.max(0, Math.min(data.length - 1, idx)))
+  }
+
+  const yMid = (yMin + yMax) / 2
+  const yMidLabel = yMid % 1 < 0.01 || yMid % 1 > 0.99 ? yMid.toFixed(0) : yMid.toFixed(2)
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <svg
+        viewBox={`0 0 ${svgW} 180`}
+        style={{ width: '100%', height: 180, display: 'block' }}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setHoverIdx(null)}
+      >
+        <line x1={margin.left} y1={yScale(yMin)} x2={svgW - margin.right} y2={yScale(yMin)} stroke="rgba(255,255,255,0.04)" strokeDasharray="3 3" />
+        <line x1={margin.left} y1={yScale(yMid)} x2={svgW - margin.right} y2={yScale(yMid)} stroke="rgba(255,255,255,0.04)" strokeDasharray="3 3" />
+        <line x1={margin.left} y1={yScale(yMax)} x2={svgW - margin.right} y2={yScale(yMax)} stroke="rgba(255,255,255,0.04)" strokeDasharray="3 3" />
+
+        <text x={margin.left - 5} y={yScale(yMax) + 3} textAnchor="end" fill="#5c5a55" fontSize={9}>{yMax.toFixed(2)}</text>
+        <text x={margin.left - 5} y={yScale(yMid) + 3} textAnchor="end" fill="#5c5a55" fontSize={9}>{yMidLabel}</text>
+        <text x={margin.left - 5} y={yScale(yMin) + 3} textAnchor="end" fill="#5c5a55" fontSize={9}>{yMin.toFixed(2)}</text>
+
+        {data.map((d, i) => {
+          const cx = xScale(i)
+          const open = d.open ?? d.price
+          const close = d.price
+          const low = d.low ?? d.price
+          const high = d.high ?? d.price
+          const up = close >= open
+          const color = up ? '#3f8600' : '#cf1322'
+          const bodyTop = Math.min(yScale(open), yScale(close))
+          const bodyH = Math.max(1, Math.abs(yScale(close) - yScale(open)))
+          const opacity = hoverIdx === i ? 1 : 0.7
+
+          return (
+            <g key={i} opacity={opacity}>
+              <line x1={cx} y1={yScale(high)} x2={cx} y2={yScale(low)} stroke={color} strokeWidth={0.5} />
+              <rect x={cx - candleW / 2} y={bodyTop} width={candleW} height={bodyH} fill={color} rx={0.5} />
+            </g>
+          )
+        })}
+
+        <polyline points={data.map((d, i) => `${xScale(i)},${yScale(d.price)}`).join(' ')} fill="none" stroke={chartColor} strokeWidth={1.2} strokeOpacity={0.5} />
+
+        {hoverIdx !== null && (
+          <line x1={xScale(hoverIdx)} y1={margin.top} x2={xScale(hoverIdx)} y2={180 - margin.bottom} stroke="#c9a84c" strokeWidth={0.5} strokeDasharray="2 2" opacity={0.5} />
+        )}
+
+        {data.length > 1 && (
+          <>
+            <text x={margin.left} y={177} fill="#5c5a55" fontSize={9}>{data[0].date}</text>
+            <text x={svgW - margin.right} y={177} textAnchor="end" fill="#5c5a55" fontSize={9}>{data[data.length - 1].date}</text>
+          </>
+        )}
+      </svg>
+
+      {hoverIdx !== null && (() => {
+        const h = data[hoverIdx]
+        return (
+          <div style={{
+            position: 'absolute', left: Math.min(xScale(hoverIdx) / svgW * 100, 60),
+            top: 5, background: '#1a1a24', border: '1px solid rgba(201,168,76,0.2)',
+            borderRadius: 8, padding: '6px 10px', fontSize: 11,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.4)', pointerEvents: 'none',
+            whiteSpace: 'nowrap',
+          }}>
+            <div style={{ color: '#9a9892', marginBottom: 3, fontSize: 10 }}>{h.date}</div>
+            <div style={{ color: '#e8e6e3' }}>
+              开 <span style={{ fontFamily: 'monospace' }}>{h.open?.toFixed(3) ?? '-'}</span>
+              <span style={{ marginLeft: 10 }}>收 <span style={{ fontFamily: 'monospace' }}>{h.price.toFixed(3)}</span></span>
+            </div>
+            <div style={{ color: '#e8e6e3', marginTop: 2 }}>
+              高 <span style={{ fontFamily: 'monospace' }}>{h.high?.toFixed(3) ?? '-'}</span>
+              <span style={{ marginLeft: 10 }}>低 <span style={{ fontFamily: 'monospace' }}>{h.low?.toFixed(3) ?? '-'}</span></span>
+            </div>
+          </div>
+        )
+      })()}
+    </div>
+  )
+}
+
+function ChartPopover({ target }: { target: Target }) {
+  const [history, setHistory] = useState<MarketHistoryItem[]>(chartCache.get(target.id) || [])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyRetry, setHistoryRetry] = useState(0)
+  const historyAttempted = useRef(false)
+  const [fundamentals, setFundamentals] = useState<any>(fundaCache.get(target.id) || null)
+  const [fundaLoading, setFundaLoading] = useState(false)
+  const [fundaRetry, setFundaRetry] = useState(0)
+  const fundaAttempted = useRef(false)
+  const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const fundaTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current)
+      if (fundaTimerRef.current) clearTimeout(fundaTimerRef.current)
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    if (!target.code) return
+    if (chartCache.has(target.id)) {
+      setHistory(chartCache.get(target.id) || [])
+      historyAttempted.current = true
+      return
+    }
+    if (historyAttempted.current && historyRetry === 0) return
+    historyAttempted.current = true
+    setHistoryLoading(true)
+    let request = chartRequestCache.get(target.id)
+    if (!request) {
+      request = marketApi.history(target.code, target.market, target.asset_type)
+        .then(data => {
+          const items = data.history || []
+          chartCache.set(target.id, items)
+          return items
+        })
+        .finally(() => { chartRequestCache.delete(target.id) })
+      chartRequestCache.set(target.id, request)
+    }
+    request
+      .then(items => {
+        if (active) setHistory(items)
+      })
+      .catch(() => {
+        if (!active) return
+        setHistory([])
+        if (!chartCache.has(target.id) && historyRetry < 2) {
+          historyTimerRef.current = setTimeout(() => setHistoryRetry(r => r + 1), 3000)
+        }
+      })
+      .finally(() => { if (active) setHistoryLoading(false) })
+    return () => { active = false }
+  }, [target.id, target.code, target.market, target.asset_type, historyRetry])
+
+  useEffect(() => {
+    let active = true
+    if (!target.code) return
+    if (fundaCache.has(target.id)) {
+      setFundamentals(fundaCache.get(target.id))
+      fundaAttempted.current = true
+      return
+    }
+    if (fundaAttempted.current && fundaRetry === 0) return
+    fundaAttempted.current = true
+    setFundaLoading(true)
+    let request = fundaRequestCache.get(target.id)
+    if (!request) {
+      request = marketApi.fundamentals(target.code, target.market, target.asset_type)
+        .then(data => {
+          fundaCache.set(target.id, data.fundamentals)
+          return data.fundamentals
+        })
+        .finally(() => { fundaRequestCache.delete(target.id) })
+      fundaRequestCache.set(target.id, request)
+    }
+    request
+      .then(data => {
+        if (active) setFundamentals(data)
+      })
+      .catch(() => {
+        if (!active) return
+        setFundamentals(null)
+        if (!fundaCache.has(target.id) && fundaRetry < 2) {
+          fundaTimerRef.current = setTimeout(() => setFundaRetry(r => r + 1), 3000)
+        }
+      })
+      .finally(() => { if (active) setFundaLoading(false) })
+    return () => { active = false }
+  }, [target.id, target.code, target.market, target.asset_type, fundaRetry])
+
+  const showNoHistory = !historyLoading && historyAttempted.current && chartCache.has(target.id) && history.length === 0
+  const showHistoryError = !historyLoading && !chartCache.has(target.id) && historyAttempted.current && historyRetry >= 2
+  const showHistoryOk = history.length > 0 && chartCache.has(target.id)
+
+  let analysis: any = null
+  try { analysis = JSON.parse(target.ai_analysis) } catch {}
+  const a = analysis?.analysis || {}
+
+  return (
+    <div style={{ width: 420 }}>
+      <div style={{ marginBottom: 10 }}>
+        <Space style={{ marginBottom: 6 }}>
+          <Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 14 }}>{target.name}</Text>
+          <Text style={{ color: '#9a9892', fontSize: 12 }}>{target.code}</Text>
+          <Tag style={{ border: `1px solid ${marketColors[target.market] || '#666'}`, color: marketColors[target.market] || '#666', background: 'transparent', borderRadius: 6, fontSize: 11 }}>{target.market}</Tag>
+        </Space>
+        <div style={{ color: '#9a9892', fontSize: 11 }}>
+          {historyLoading ? '正在加载行情数据...' : showHistoryOk ? `K 线（${history.length} 个交易日）` : showNoHistory ? '暂无行情数据' : showHistoryError ? '行情数据加载失败' : history.length > 0 ? `K 线（${history.length} 个交易日）` : ''}
+        </div>
+      </div>
+
+      {historyLoading && (
+        <div style={{ width: '100%', height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <Spin />
+        </div>
+      )}
+
+      {showHistoryOk && (
+        <div style={{ marginBottom: 12 }}>
+          <KLineChart data={history} />
+        </div>
+      )}
+
+      {!historyLoading && (showNoHistory || showHistoryError) && (
+        <div style={{ width: '100%', minHeight: 100, marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 8, background: 'rgba(26, 26, 36, 0.3)', border: '1px solid rgba(255,255,255,0.04)' }}>
+          <Text style={{ color: '#5c5a55', fontSize: 12 }}>{showHistoryError ? '行情走势加载失败，请稍后重试' : '该标的暂无可用行情走势'}</Text>
+        </div>
+      )}
+
+      <FundamentalsDisplay data={fundamentals || {}} loading={fundaLoading} />
+
+      {a.fundamental && (
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(201,168,76,0.04)', border: '1px solid rgba(201,168,76,0.1)' }}>
+          <Space style={{ marginBottom: 6 }}>
+            <FundOutlined style={{ color: '#c9a84c', fontSize: 12 }} />
+            <Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>AI 观点（以实时指标为准）</Text>
+          </Space>
+          <div style={{ color: '#c9c7c0', fontSize: 12, lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>{a.fundamental}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AnalysisPopover({ target }: { target: Target }) {
+  let analysis: any = null
+  try { analysis = JSON.parse(target.ai_analysis) } catch {}
+  if (!analysis) return <Text style={{ color: '#5c5a55' }}>暂无分析数据</Text>
+
+  const a = analysis.analysis || {}
+  const sectionStyle = {
+    padding: '10px 14px',
+    borderRadius: 8,
+    background: 'rgba(26, 26, 36, 0.5)',
+    border: '1px solid rgba(255,255,255,0.04)',
+    marginBottom: 8,
+  }
+  const contentStyle: React.CSSProperties = { color: '#c9c7c0', fontSize: 12, lineHeight: 1.6 }
+
+  return (
+    <div style={{ width: 400, maxHeight: 440, overflowY: 'auto' as const, margin: '-4px 0' }}>
+      {analysis.priority && (
+        <div style={{ marginBottom: 10 }}>
+          <span style={{ padding: '3px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600, background: 'rgba(201,168,76,0.06)', border: '1px solid rgba(201,168,76,0.12)', color: priorityColors[analysis.priority] || '#666' }}>
+            <StarFilled style={{ marginRight: 2 }} />{analysis.priority === 'HIGH' ? '高' : analysis.priority === 'MEDIUM' ? '中' : '低'}优先级
+          </span>
+        </div>
+      )}
+
+      {analysis.reason && (
+        <div style={{ padding: '8px 12px', borderRadius: 8, background: 'rgba(201,168,76,0.06)', border: '1px solid rgba(201,168,76,0.12)', marginBottom: 8 }}>
+          <Text style={{ color: '#b0aea8', fontSize: 12 }}>{analysis.reason}</Text>
+        </div>
+      )}
+
+      {a.fundamental && <div style={sectionStyle}>
+        <Space style={{ marginBottom: 4 }}><FundOutlined style={{ color: '#c9a84c', fontSize: 12 }} /><Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>AI 基本面观点</Text></Space>
+        <div style={contentStyle}>{a.fundamental}</div>
+      </div>}
+
+      {a.technical && <div style={sectionStyle}>
+        <Space style={{ marginBottom: 4 }}><LineChartOutlined style={{ color: '#c9a84c', fontSize: 12 }} /><Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>技术面</Text></Space>
+        <div style={contentStyle}>{a.technical}</div>
+      </div>}
+
+      {a.macro_impact && <div style={sectionStyle}>
+        <Space style={{ marginBottom: 4 }}><GlobalOutlined style={{ color: '#c9a84c', fontSize: 12 }} /><Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>宏观影响</Text></Space>
+        <div style={contentStyle}>{a.macro_impact}</div>
+      </div>}
+
+      {a.micro_catalysts && <div style={sectionStyle}>
+        <Space style={{ marginBottom: 4 }}><ThunderboltFilled style={{ color: '#c9a84c', fontSize: 12 }} /><Text style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12 }}>催化剂</Text></Space>
+        <div style={contentStyle}>{a.micro_catalysts}</div>
+      </div>}
+
+      {a.investment_thesis && <div style={{ ...sectionStyle, borderColor: 'rgba(201,168,76,0.2)', background: 'rgba(201,168,76,0.04)' }}>
+        <Space style={{ marginBottom: 4 }}><ExperimentOutlined style={{ color: '#c9a84c', fontSize: 12 }} /><Text style={{ color: '#c9a84c', fontWeight: 600, fontSize: 12 }}>核心逻辑</Text></Space>
+        <div style={{ ...contentStyle, color: '#d4d0c8' }}>{a.investment_thesis}</div>
+      </div>}
+    </div>
+  )
+}
+
+export default function Targets() {
+  const [targets, setTargets] = useState<Target[]>([])
+  const [loading, setLoading] = useState(true)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [clearModalOpen, setClearModalOpen] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const [prices, setPrices] = useState<Record<number, { current: number; change_pct: number | null }>>({})
+  const [form] = Form.useForm()
+
+  const [marketFilter, setMarketFilter] = useState<string[]>([])
+  const [assetTypeFilter, setAssetTypeFilter] = useState<string[]>([])
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [groupBy, setGroupBy] = useState<'none' | 'asset_type' | 'source' | 'market'>('none')
+
+  const fetchTargets = useCallback(async () => {
+    setLoading(true)
+    try {
+      const data = await targetsApi.list({ status: 'active' })
+      setTargets(data)
+      const priceMap: Record<number, { current: number; change_pct: number | null }> = {}
+      await Promise.all(data.filter(t => t.code).map(async (t) => {
+        try {
+          const q = await marketApi.quote(t.code, t.market, t.asset_type)
+          if (q.current_price != null) {
+            priceMap[t.id] = { current: q.current_price, change_pct: q.change_pct }
+          }
+        } catch {}
+      }))
+      setPrices(priceMap)
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchTargets()
+    // Load saved AI recommend config
+    Promise.all([
+      settingsApi.get('ai_recommend_markets').catch(() => ({ value: '' })),
+      settingsApi.get('ai_recommend_asset_types').catch(() => ({ value: '' })),
+    ]).then(([m, t]) => {
+      if (m.value) setMarketFilter(m.value.split(',').filter(Boolean))
+      if (t.value) setAssetTypeFilter(t.value.split(',').filter(Boolean))
+    })
+  }, [fetchTargets])
+
+  const saveFilterSettings = useCallback((markets: string[], types: string[]) => {
+    settingsApi.update('ai_recommend_markets', markets.join(',')).catch(() => {})
+    settingsApi.update('ai_recommend_asset_types', types.join(',')).catch(() => {})
+  }, [])
+
+  const handleMarketFilterChange = (v: string[]) => {
+    setMarketFilter(v)
+    saveFilterSettings(v, assetTypeFilter)
+  }
+
+  const handleAssetTypeFilterChange = (v: string[]) => {
+    setAssetTypeFilter(v)
+    saveFilterSettings(marketFilter, v)
+  }
+
+  const filteredTargets = targets.filter(t => {
+    if (marketFilter.length > 0 && !marketFilter.includes(t.market)) return false
+    if (assetTypeFilter.length > 0 && !assetTypeFilter.includes(t.asset_type)) return false
+    if (sourceFilter && t.source !== sourceFilter) return false
+    return true
+  })
+
+  const getGroupedData = () => {
+    if (groupBy === 'none') return null
+    const groups: Record<string, Target[]> = {}
+    filteredTargets.forEach(t => {
+      const key = t[groupBy]
+      const label = (groupLabels[groupBy] || {})[key] || key || '其他'
+      if (!groups[label]) groups[label] = []
+      groups[label].push(t)
+    })
+    return groups
+  }
+
+  const handleCreate = async () => {
+    const values = await form.validateFields()
+    await targetsApi.create({ ...values, source: 'manual', status: 'active' })
+    message.success('添加成功')
+    setModalOpen(false)
+    form.resetFields()
+    fetchTargets()
+  }
+
+  const handleDelete = async (id: number) => {
+    await targetsApi.delete(id)
+    message.success('已移除')
+    fetchTargets()
+  }
+
+  const handleAiAnalyze = async () => {
+    setAnalyzing(true)
+    try {
+      const result = await targetsApi.aiAnalyze({
+        markets: marketFilter,
+        asset_types: assetTypeFilter,
+      })
+      message.success(result.summary || 'AI 标的分析完成')
+      fetchTargets()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '分析失败')
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
+  const handleClearAll = async () => {
+    setClearing(true)
+    try {
+      await targetsApi.clearAll()
+      message.success('所有标的已清空')
+      setClearModalOpen(false)
+      fetchTargets()
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '清空失败')
+    } finally {
+      setClearing(false)
+    }
+  }
+
+  const columns = [
+    {
+      title: '标的名称', dataIndex: 'name', key: 'name', width: 150,
+      render: (v: string, r: Target) => (
+        <Space>
+          <span style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 13 }}>{v}</span>
+          {r.source === 'ai_recommended' && (
+            <Tooltip title="AI 推荐">
+              <RobotOutlined style={{ color: '#c9a84c', fontSize: 12 }} />
+            </Tooltip>
+          )}
+        </Space>
+      ),
+    },
+    {
+      title: '代码', dataIndex: 'code', key: 'code', width: 120,
+      render: (v: string) => v ? <span style={{ fontSize: 13, fontFamily: 'monospace' }}>{v}</span> : <span style={{ color: '#5c5a55' }}>-</span>,
+    },
+    {
+      title: '市场', dataIndex: 'market', key: 'market', width: 60,
+      render: (v: string) => (
+        <Tag style={{ border: `1px solid ${marketColors[v] || '#666'}`, color: marketColors[v] || '#666', background: 'transparent', borderRadius: 6, fontSize: 11 }}>{v}</Tag>
+      ),
+    },
+    {
+      title: '来源', dataIndex: 'source', key: 'source', width: 90,
+      render: (v: string) => (
+        <Tag style={{ borderRadius: 6, fontSize: 11, background: v === 'ai_recommended' ? 'rgba(201,168,76,0.15)' : 'rgba(255,255,255,0.06)', border: 'none', color: v === 'ai_recommended' ? '#c9a84c' : '#9a9892' }}>
+          {sourceLabels[v] || v}
+        </Tag>
+      ),
+    },
+    {
+      title: '优先级', dataIndex: 'priority', key: 'priority', width: 90,
+      render: (v: string) => {
+        const Icon = v === 'HIGH' ? StarFilled : StarOutlined
+        return <span style={{ color: priorityColors[v] || '#666', fontWeight: 500, fontSize: 13, whiteSpace: 'nowrap' }}><Icon style={{ marginRight: 4 }} />{v}</span>
+      },
+    },
+    {
+      title: '风险等级', dataIndex: 'risk_level', key: 'risk_level', width: 90,
+      render: (v: string) => <span style={{ color: riskColors[v] || '#666', fontSize: 13, whiteSpace: 'nowrap' }}>{v}</span>,
+    },
+    {
+      title: '推荐后涨跌', key: 'change', width: 110,
+      render: (_: any, r: Target) => {
+        const price = prices[r.id]
+        let recPrice: number | null = null
+        try { recPrice = JSON.parse(r.ai_analysis)?.recommended_price } catch {}
+        if (recPrice != null && price) {
+          const change = ((price.current - recPrice) / recPrice * 100)
+          const isPositive = change >= 0
+          return (
+            <Tooltip title={`推荐时 ${recPrice.toFixed(2)} → 当前 ${price.current.toFixed(2)}`}>
+              <span style={{ color: isPositive ? '#3f8600' : '#cf1322', fontWeight: 500, fontSize: 13, whiteSpace: 'nowrap' }}>
+                {isPositive ? '+' : ''}{change.toFixed(2)}%
+              </span>
+            </Tooltip>
+          )
+        }
+        return <span style={{ color: '#5c5a55', fontSize: 12 }}>-</span>
+      },
+    },
+    {
+      title: '预期收益', dataIndex: 'expected_return', key: 'expected_return', width: 110,
+      render: (v: string) => v ? <span style={{ color: '#3f8600', fontSize: 13, whiteSpace: 'nowrap' }}>{v}</span> : <span style={{ color: '#5c5a55' }}>-</span>,
+    },
+    {
+      title: '推荐理由', dataIndex: 'reason', key: 'reason', width: 200,
+      render: (v: string) => v ? (
+        <Tooltip title={v} mouseEnterDelay={0.3}>
+          <span style={{ fontSize: 12, display: 'inline-block', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</span>
+        </Tooltip>
+      ) : <span style={{ color: '#5c5a55' }}>-</span>,
+    },
+    {
+      title: '', key: 'actions', width: 90,
+      render: (_: any, r: Target) => (
+        <Space size={2}>
+          <Popover
+            content={<ChartPopover target={r} />}
+            title={`${r.name} 行情走势`}
+            trigger="hover"
+            placement="left"
+            overlayInnerStyle={{ padding: 14 }}
+          >
+            <Button type="text" size="small" icon={<BarChartOutlined />} style={{ color: '#9a9892' }} />
+          </Popover>
+          {r.ai_analysis && r.ai_analysis !== '{}' && (
+            <Popover
+              content={<AnalysisPopover target={r} />}
+              title={`${r.name} 分析详情`}
+              trigger="hover"
+              placement="left"
+              overlayInnerStyle={{ padding: 14, maxHeight: 520, overflowY: 'auto' }}
+            >
+              <Button type="text" size="small" icon={<InfoCircleOutlined />} style={{ color: '#c9a84c' }} />
+            </Popover>
+          )}
+          <Popconfirm title="移除该标的？" onConfirm={() => handleDelete(r.id)} okText="确定" cancelText="取消">
+            <Button type="text" size="small" icon={<DeleteOutlined />} style={{ color: '#5c5a55' }} />
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ]
+
+  const renderGroupedTables = () => {
+    const grouped = getGroupedData()
+    if (!grouped) {
+      return (
+        <Table
+          dataSource={filteredTargets}
+          columns={columns}
+          rowKey="id"
+          loading={loading}
+          scroll={{ x: 1160 }}
+          pagination={{ pageSize: 20, showSizeChanger: true, showTotal: t => `共 ${t} 个标的` }}
+        />
+      )
+    }
+    return Object.entries(grouped).map(([group, items]) => (
+      <div key={group} style={{ marginBottom: 20 }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '8px 12px', marginBottom: 8,
+          borderRadius: 10, background: 'rgba(201,168,76,0.04)',
+          border: '1px solid rgba(201,168,76,0.08)',
+        }}>
+          <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#c9a84c' }} />
+          <span style={{ fontWeight: 600, color: '#e8e6e3', fontSize: 14 }}>{group}</span>
+          <span style={{ color: '#5c5a55', fontSize: 12 }}>共 {items.length} 项</span>
+        </div>
+        <Table
+          dataSource={items}
+          columns={columns}
+          rowKey="id"
+          loading={loading}
+          scroll={{ x: 1160 }}
+          pagination={false}
+        />
+      </div>
+    ))
+  }
+
+  return (
+    <div className="page-enter">
+      <Card
+        title={<Space><AimOutlined style={goldStyle} /><span>我的标的</span></Space>}
+        extra={
+          <Space>
+            <Button
+              icon={<ClearOutlined />}
+              onClick={() => setClearModalOpen(true)}
+              style={{ borderRadius: 10, height: 36, fontWeight: 500, borderColor: 'rgba(207,19,34,0.3)', color: '#cf1322' }}
+            >
+              清空标的
+            </Button>
+            <Button
+              icon={<PlusOutlined />}
+              onClick={() => { form.resetFields(); setModalOpen(true) }}
+              style={{ borderRadius: 10, height: 36, fontWeight: 500 }}
+            >
+              手动添加标的
+            </Button>
+            <Button
+              type="primary"
+              icon={<ThunderboltOutlined />}
+              loading={analyzing}
+              onClick={handleAiAnalyze}
+              style={{ borderRadius: 10, height: 36, fontWeight: 500 }}
+            >
+              AI 标的投资建议
+            </Button>
+          </Space>
+        }
+      >
+        <div style={{ marginBottom: 16, padding: '12px 16px', borderRadius: 10, background: 'rgba(201,168,76,0.06)', border: '1px solid rgba(201,168,76,0.12)' }}>
+          <Space>
+            <BulbOutlined style={{ color: '#c9a84c', fontSize: 16 }} />
+            <Text style={{ color: '#b0aea8', fontSize: 13 }}>
+              标的是你关注的投资目标。鼠标悬停在 <BarChartOutlined style={{ color: '#9a9892' }} /> 可查看行情走势，<InfoCircleOutlined style={{ color: '#c9a84c' }} /> 可查看 AI 多维度分析。
+            </Text>
+          </Space>
+        </div>
+
+        <Row gutter={[16, 12]} style={{ marginBottom: 16 }} align="middle">
+          <Col flex="auto">
+            <Space wrap size={[4, 8]}>
+              <Space size={4}>
+                <Text style={{ color: '#9a9892', fontSize: 12, whiteSpace: 'nowrap' }}>AI 推荐范围</Text>
+                <Select
+                  mode="multiple"
+                  value={marketFilter}
+                  onChange={handleMarketFilterChange}
+                  options={marketFilterOptions.slice(1)}
+                  style={{ minWidth: 150 }}
+                  size="small"
+                  placeholder="选择市场"
+                  maxTagCount={2}
+                />
+                <Select
+                  mode="multiple"
+                  value={assetTypeFilter}
+                  onChange={handleAssetTypeFilterChange}
+                  options={assetTypeFilterOptions.slice(1)}
+                  style={{ minWidth: 150 }}
+                  size="small"
+                  placeholder="选择类型"
+                  maxTagCount={2}
+                />
+              </Space>
+              <Select
+                value={sourceFilter}
+                onChange={setSourceFilter}
+                options={sourceFilterOptions}
+                style={{ width: 120 }}
+                size="small"
+              />
+            </Space>
+          </Col>
+          <Col>
+            <Radio.Group
+              options={groupByOptions}
+              value={groupBy}
+              onChange={e => setGroupBy(e.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              size="small"
+            />
+          </Col>
+        </Row>
+
+        {renderGroupedTables()}
+      </Card>
+
+      <Modal title="添加标的" open={modalOpen} onOk={handleCreate} onCancel={() => setModalOpen(false)} okText="添加" cancelText="取消" width={520} destroyOnClose>
+        <Form form={form} layout="vertical" size="large" style={{ marginTop: 16 }}>
+          <Form.Item name="name" label="标的名称" rules={[{ required: true, message: '请输入标的名称' }]}>
+            <Input placeholder="如：贵州茅台、腾讯控股" />
+          </Form.Item>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="code" label="代码">
+                <Input placeholder="如：600519" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="market" label="市场" initialValue="A">
+                <Select options={[{ label: 'A 股', value: 'A' }, { label: '港股', value: 'HK' }, { label: '美股', value: 'US' }]} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name="asset_type" label="类型" initialValue="stock">
+                <Select options={[{ label: '股票', value: 'stock' }, { label: '场外基金', value: 'offshore_fund' }, { label: '场内基金', value: 'onshore_fund' }]} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="priority" label="优先级" initialValue="MEDIUM">
+                <Select options={[{ label: '高', value: 'HIGH' }, { label: '中', value: 'MEDIUM' }, { label: '低', value: 'LOW' }]} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Form.Item name="reason" label="关注理由">
+            <Input.TextArea rows={2} placeholder="为什么关注这个标的？" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={<Space><WarningOutlined style={{ color: '#ff4d4f' }} /><span style={{ color: '#ff4d4f' }}>清空所有标的</span></Space>}
+        open={clearModalOpen}
+        onOk={handleClearAll}
+        onCancel={() => setClearModalOpen(false)}
+        okText="确认清空"
+        cancelText="取消"
+        confirmLoading={clearing}
+        okButtonProps={{ danger: true, style: { borderRadius: 10, fontWeight: 500 } }}
+        cancelButtonProps={{ style: { borderRadius: 10 } }}
+      >
+        <div style={{ padding: 16, borderRadius: 10, background: 'rgba(207, 19, 34, 0.08)', border: '1px solid rgba(207, 19, 34, 0.2)', marginTop: 8 }}>
+          <Space direction="vertical" size={8}>
+            <Text style={{ color: '#ff4d4f', fontSize: 14, fontWeight: 500 }}>此操作将永久删除所有标的记录</Text>
+            <ul style={{ color: '#b0aea8', fontSize: 13, margin: 0, paddingLeft: 20, lineHeight: 2 }}>
+              <li>手动添加的标的</li>
+              <li>AI 推荐的所有标的及分析数据</li>
+            </ul>
+            <Text style={{ color: '#cf1322', fontSize: 13, fontWeight: 500 }}>⚠️ 此操作不可撤销！</Text>
+          </Space>
+        </div>
+      </Modal>
+    </div>
+  )
+}

@@ -49,18 +49,7 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
     total_pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0
 
     from data_source import get_fundamentals
-    from models import DataSource
-
-    client = OpenAI(api_key=api_key, base_url=base_url or None)
-
     providers = {}
-    try:
-        sources = db.query(DataSource).all()
-        for s in sources:
-            providers[s.asset_type] = providers.get(s.asset_type, {})
-            providers[s.asset_type][s.market] = s.provider
-    except Exception:
-        pass
 
     asset_summary = []
     for a in assets:
@@ -108,6 +97,7 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
   "detail": "详细分析报告（包括市场回顾、各资产表现（引用真实PE/PB）、风险提示和操作建议，200-500字）"
 }}"""
 
+    client = OpenAI(api_key=api_key, base_url=base_url or None)
     try:
         response = client.chat.completions.create(
             model=model,

@@ -20,6 +20,22 @@ def get_db():
         db.close()
 
 
+def _migrate():
+    """Add columns missing in existing DB (SQLite's create_all doesn't alter)."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    for table, col_defs in [
+        ("analysis_records", [("asset_id", "INTEGER REFERENCES assets(id)")]),
+    ]:
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        for col_name, col_type in col_defs:
+            if col_name not in existing:
+                with engine.connect() as conn:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
+                    conn.commit()
+
+
 def init_db():
     import models
     Base.metadata.create_all(bind=engine)
+    _migrate()

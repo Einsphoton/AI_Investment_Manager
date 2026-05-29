@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
   Card, Table, Button, Modal, Form, Input, InputNumber, Space,
   Tag, message, Row, Col, Radio, Popconfirm, Typography, DatePicker,
@@ -8,7 +9,7 @@ import dayjs from 'dayjs'
 import {
   PlusOutlined, EditOutlined, DeleteOutlined,
   AppstoreOutlined, BankOutlined, StockOutlined, SearchOutlined, ReloadOutlined,
-  EyeOutlined, PlusCircleOutlined, FileTextOutlined
+  EyeOutlined, PlusCircleOutlined, FileTextOutlined, ThunderboltOutlined
 } from '@ant-design/icons'
 import {
   AreaChart, Area, ResponsiveContainer, LineChart, Line, XAxis, YAxis,
@@ -199,7 +200,9 @@ export default function Assets() {
   const [assetDetail, setAssetDetail] = useState<AssetDetail | null>(null)
   const [transactionModalOpen, setTransactionModalOpen] = useState(false)
   const [savingTransaction, setSavingTransaction] = useState(false)
-  const [aiAnalyzing, setAiAnalyzing] = useState(false)
+
+  const lastAutoNameRef = useRef<string | null>(null)
+  const lookupSeqRef = useRef(0)
 
   const fetchPriceHistory = useCallback(async (assets: Asset[]) => {
     const results: Record<number, MarketHistoryItem[]> = {}
@@ -243,6 +246,78 @@ export default function Assets() {
     }
   }
 
+  const aiCtx = useAIWorkContext()
+
+  const handleAnalyzeAll = async () => {
+    if (assets.length === 0) {
+      aiCtx.startTask('AI 全面分析')
+      aiCtx.failTask('暂无资产需要分析')
+      return
+    }
+    aiCtx.startTask('AI 全面分析')
+    try {
+      const ids = assets.map(a => a.id)
+      const totalAssets = ids.length
+      const batchSize = Math.min(3, Math.max(1, Math.ceil(totalAssets / 3)))
+      const batches: number[][] = []
+      for (let i = 0; i < ids.length; i += batchSize) {
+        batches.push(ids.slice(i, i + batchSize))
+      }
+
+      aiCtx.setParallelMode(true)
+      for (let i = 0; i < batches.length; i++) {
+        aiCtx.registerSubTask(`batch-${i}`,
+          `资产分析 (${i * batchSize + 1}-${Math.min((i + 1) * batchSize, totalAssets)})`, '📊')
+      }
+
+      aiCtx.addLog('正在获取市场行情与基本面数据...', 'thinking', '准备')
+      await new Promise(r => setTimeout(r, 200))
+
+      const batchTasks = batches.map(async (batchIds, i) => {
+        aiCtx.updateSubTask(`batch-${i}`, { status: 'running', thinking: `开始分析 ${batchIds.length} 项资产...`, progress: 5 })
+        aiCtx.addLog(`第 ${i + 1} 批: 分析 ${batchIds.length} 项资产...`, 'thinking', `批 ${i + 1}`)
+
+        const result = await aiCtx.withPhase({
+          from: 5, to: 95, duration: 15000, tag: `批 ${i + 1}`,
+          thinkingMessages: [
+            `AI 正在分析第 ${i + 1} 批资产...`,
+            '正在评估资产基本面...',
+            '正在分析技术面走势...',
+            '正在计算风险指标...',
+            '正在生成交易建议...',
+          ],
+          logMessages: [
+            '调用 AI 模型分析中...',
+            '分析资产基本面数据...',
+            '评估市场行情走势...',
+            '计算风险收益比...',
+            '生成结构化分析报告...',
+          ],
+        }, () => analysisApi.agentRun({
+          asset_ids: batchIds,
+          goal: `请对以下 ${batchIds.length} 项投资资产生成详细分析报告。覆盖宏观、微观、基本面、技术面，给出具体投资建议。`,
+        }))
+        aiCtx.updateSubTask(`batch-${i}`, { status: 'completed', progress: 100, thinking: '分析完成' })
+        aiCtx.addLog(`✅ 第 ${i + 1} 批分析完成`, 'success', `批 ${i + 1}`)
+        return result
+      })
+
+      await Promise.all(batchTasks)
+      aiCtx.addLog('✅ AI 全面分析完成', 'success')
+
+      if (detailOpen && selectedAsset) {
+        await aiCtx.withPhase({
+          from: 96, to: 100, duration: 2000, tag: '刷新',
+          thinkingMessages: ['正在刷新资产详情...'],
+          logMessages: ['更新页面数据...'],
+        }, () => loadAssetDetail(selectedAsset))
+      }
+      aiCtx.completeTask()
+    } catch (e: any) {
+      aiCtx.failTask(e?.response?.data?.detail || 'AI 分析失败')
+    }
+  }
+
   useEffect(() => {
     const init = async () => {
       const data = await fetchAssets()
@@ -255,12 +330,16 @@ export default function Assets() {
 
   const openAddModal = () => {
     setEditingAsset(null)
+    lastAutoNameRef.current = null
+    lookupSeqRef.current += 1
     form.resetFields()
     setModalOpen(true)
   }
 
   const openEditModal = (asset: Asset) => {
     setEditingAsset(asset)
+    lastAutoNameRef.current = null
+    lookupSeqRef.current += 1
     form.setFieldsValue({ ...asset, buy_date: asset.buy_date ? dayjs(asset.buy_date) : null })
     setModalOpen(true)
   }
@@ -270,21 +349,36 @@ export default function Assets() {
 
   const handleLookupName = async (code?: string) => {
     const values = form.getFieldsValue()
-    const c = code || values.code
-    if (!c || values.name) return
+    const c = (code || values.code || '').trim().toUpperCase()
+    if (!c) return
     const market = values.market
     const assetType = values.asset_type
     if (!market || !assetType) return
+    const currentName = (values.name || '').trim()
+    if (currentName && currentName !== lastAutoNameRef.current) return
+    const seq = lookupSeqRef.current + 1
+    lookupSeqRef.current = seq
     setLookupLoading(true)
     try {
-      const result = await marketApi.lookup(c.trim().toUpperCase(), market, assetType)
+      const result = await marketApi.lookup(c, market, assetType)
+      const latestValues = form.getFieldsValue()
+      const latestCode = (latestValues.code || '').trim().toUpperCase()
+      if (seq !== lookupSeqRef.current || latestCode !== c || latestValues.market !== market || latestValues.asset_type !== assetType) {
+        return
+      }
       if (result.name) {
+        lastAutoNameRef.current = result.name
         form.setFieldsValue({ name: result.name })
+      } else if ((latestValues.name || '').trim() === lastAutoNameRef.current) {
+        lastAutoNameRef.current = null
+        form.setFieldsValue({ name: undefined })
       }
     } catch (e) {
       // silent
     } finally {
-      setLookupLoading(false)
+      if (seq === lookupSeqRef.current) {
+        setLookupLoading(false)
+      }
     }
   }
 
@@ -296,8 +390,13 @@ export default function Assets() {
     const code = form.getFieldValue('code')
     const market = form.getFieldValue('market')
     const assetType = form.getFieldValue('asset_type')
-    const name = form.getFieldValue('name')
-    if (code && market && assetType && !name) {
+    const name = (form.getFieldValue('name') || '').trim()
+    const nameWasAutoFilled = Boolean(name && name === lastAutoNameRef.current)
+    if (nameWasAutoFilled) {
+      form.setFieldsValue({ name: undefined })
+      lastAutoNameRef.current = null
+    }
+    if (code && market && assetType && (!name || nameWasAutoFilled)) {
       const timer = setTimeout(() => handleLookupName(code), 400)
       setLookupTimer(timer)
     }
@@ -394,18 +493,65 @@ export default function Assets() {
   const handleRunAssetAnalysis = async () => {
     const asset = assetDetail?.asset || selectedAsset
     if (!asset) return
-    setAiAnalyzing(true)
+    aiCtx.startTask('AI 资产分析')
     try {
-      await analysisApi.agentRun({
+      aiCtx.setParallelMode(true)
+      aiCtx.registerSubTask('data', '数据采集', '📡')
+      aiCtx.registerSubTask('market', '行情分析', '📈')
+      aiCtx.registerSubTask('ai', 'AI 深度分析', '🤖')
+
+      // Phase 1: Data collection with streaming
+      aiCtx.updateSubTask('data', { status: 'running', thinking: '正在获取资产数据...', progress: 5 })
+      await aiCtx.withPhase({
+        from: 5, to: 95, duration: 3000, tag: '数据',
+        thinkingMessages: ['正在读取资产信息...', '正在加载交易记录...', '正在计算持仓成本...'],
+        logMessages: ['查询资产基本信息...', '加载历史交易记录...', '计算持仓成本与市值...'],
+      }, async () => { await new Promise(r => setTimeout(r, 400)); return })
+      aiCtx.updateSubTask('data', { status: 'completed', progress: 100, thinking: '数据采集完成' })
+
+      // Phase 2: Market data
+      aiCtx.updateSubTask('market', { status: 'running', thinking: '正在获取市场行情...', progress: 5 })
+      await aiCtx.withPhase({
+        from: 5, to: 95, duration: 4000, tag: '行情',
+        thinkingMessages: ['正在获取最新行情...', '正在获取基本面数据...', '正在分析技术面走势...'],
+        logMessages: ['获取实时价格数据...', '获取基本面指标...', '获取历史走势数据...'],
+      }, async () => { await new Promise(r => setTimeout(r, 500)); return })
+      aiCtx.updateSubTask('market', { status: 'completed', progress: 100, thinking: '行情获取完成' })
+
+      // Phase 3: AI deep analysis
+      aiCtx.updateSubTask('ai', { status: 'running', thinking: 'AI 开始深度分析...', progress: 5 })
+      await aiCtx.withPhase({
+        from: 5, to: 95, duration: 15000, tag: 'AI',
+        thinkingMessages: [
+          'AI 正在深度分析资产...',
+          '正在评估基本面数据...',
+          '正在分析技术面走势...',
+          '正在生成交易策略...',
+          '正在编写分析报告...',
+        ],
+        logMessages: [
+          '调用 AI 模型进行分析...',
+          '分析资产基本面指标...',
+          '评估技术面趋势...',
+          '生成投资建议...',
+          '生成结构化分析报告...',
+        ],
+      }, () => analysisApi.agentRun({
         asset_ids: [asset.id],
         goal: `请针对 ${asset.name || asset.code} 这一项资产生成详细分析报告，覆盖基本面、技术面交易策略、具体交易建议、宏观信息和微观信息。`,
-      })
-      message.success('AI 分析报告已更新')
-      await loadAssetDetail(asset)
+      }))
+      aiCtx.updateSubTask('ai', { status: 'completed', progress: 100, thinking: 'AI 分析完成' })
+      aiCtx.addLog('✅ AI 分析报告已更新', 'success', 'AI')
+
+      await aiCtx.withPhase({
+        from: 96, to: 100, duration: 2000, tag: '刷新',
+        thinkingMessages: ['正在刷新页面...'],
+        logMessages: ['加载最新分析报告...'],
+      }, () => loadAssetDetail(asset))
+      aiCtx.addLog('✅ 分析完成', 'success')
+      aiCtx.completeTask()
     } catch (e: any) {
-      message.error(e?.response?.data?.detail || 'AI 分析失败')
-    } finally {
-      setAiAnalyzing(false)
+      aiCtx.failTask(e?.response?.data?.detail || 'AI 分析失败')
     }
   }
 
@@ -443,17 +589,17 @@ export default function Assets() {
       render: (v: number) => <span style={{ fontWeight: 500 }}>{v.toFixed(2)}</span>,
     },
     {
-      title: '买入单价', dataIndex: 'buy_price', key: 'buy_price', width: 90,
-      render: (v: number) => <span style={{ color: '#9a9892' }}>¥{v.toFixed(3)}</span>,
+      title: '买入单价', dataIndex: 'buy_price', key: 'buy_price', width: 95,
+      render: (v: number) => <span style={{ color: '#9a9892' }}>¥{v.toFixed(4)}</span>,
     },
     {
       title: '当前价', dataIndex: 'current_price', key: 'current_price', width: 85,
-      render: (v: number) => v ? <span style={{ color: '#9a9892' }}>¥{v.toFixed(3)}</span> : <span style={{ color: '#5c5a55' }}>-</span>,
+      render: (v: number | null) => v != null && v > 0 ? <span style={{ color: '#9a9892' }}>¥{v.toFixed(3)}</span> : <span style={{ color: '#5c5a55' }}>-</span>,
     },
     {
       title: '当前市值', key: 'market_value', width: 100,
       render: (_: any, r: Asset) => {
-        if (!r.current_price) return <span style={{ color: '#5c5a55' }}>-</span>
+        if (r.current_price == null || r.current_price <= 0) return <span style={{ color: '#5c5a55' }}>-</span>
         const mv = r.shares * r.current_price
         return <span style={{ fontWeight: 500, color: '#e8e6e3' }}>¥{mv.toFixed(2)}</span>
       },
@@ -466,7 +612,7 @@ export default function Assets() {
     {
       title: '盈亏', key: 'pnl', width: 110,
       render: (_: any, r: Asset) => {
-        if (!r.current_price) return <span style={{ color: '#5c5a55' }}>暂无数据</span>
+        if (r.current_price == null || r.current_price <= 0) return <span style={{ color: '#5c5a55' }}>暂无数据</span>
         const pnl = r.shares * (r.current_price - r.buy_price)
         const pct = (r.current_price - r.buy_price) / r.buy_price * 100
         const color = pnl >= 0 ? greenStyle.color : redStyle.color
@@ -483,10 +629,11 @@ export default function Assets() {
       render: (_: any, r: Asset) => {
         let data = priceHistory[r.id]
         if (!data || data.length < 2) {
-          if (!r.current_price) return <span style={{ color: '#5c5a55' }}>-</span>
+          const cp = r.current_price
+          if (cp == null || cp <= 0) return <span style={{ color: '#5c5a55' }}>-</span>
           data = Array.from({ length: 20 }, (_, i) => ({
             date: '',
-            price: r.buy_price + (r.current_price - r.buy_price) * (i + 1) / 20,
+            price: r.buy_price + (cp - r.buy_price) * (i + 1) / 20,
           }))
         }
         const isUp = (data[data.length - 1].price >= data[0].price)
@@ -689,22 +836,224 @@ export default function Assets() {
     )
   }
 
+  const suggestionColor = (s: string) => {
+    const m: Record<string, string> = {
+      BUY: greenStyle.color, ADD: greenStyle.color,
+      HOLD: goldStyle.color,
+      REDUCE: redStyle.color, SELL: redStyle.color,
+    }
+    return m[s] || '#9a9892'
+  }
+
+  const suggestionLabel = (s: string) => {
+    const m: Record<string, string> = {
+      BUY: '买入', ADD: '加仓',
+      HOLD: '持有',
+      REDUCE: '减仓', SELL: '卖出',
+    }
+    return m[s] || s
+  }
+
   const renderAnalysisContent = (detail: string) => {
     try {
       const parsed = JSON.parse(detail)
-      return (
-        <pre style={{
-          whiteSpace: 'pre-wrap',
-          margin: 0,
-          color: '#cfcac1',
-          fontSize: 12,
-          lineHeight: 1.7,
-          maxHeight: 360,
-          overflow: 'auto',
-        }}>
-          {JSON.stringify(parsed, null, 2)}
-        </pre>
-      )
+      if (parsed?.asset_code && parsed?.final_suggestion) {
+        const s = parsed.final_suggestion
+        const color = suggestionColor(s)
+        const reportSections = [
+          { title: '宏观影响', value: parsed.macro_impact },
+          { title: '微观因素', value: parsed.micro_factors },
+          { title: '基本面分析', value: parsed.fundamentals_analysis },
+          { title: '技术面走势', value: parsed.technical_analysis },
+          { title: '风险提示', value: parsed.risk_warning },
+          { title: '数据质量', value: parsed.data_quality },
+        ].filter(item => item.value)
+        return (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+              <Tag color={color} style={{ borderRadius: 6, border: 'none', color: '#fff', fontWeight: 600, fontSize: 14, padding: '2px 14px' }}>
+                {suggestionLabel(s)}
+              </Tag>
+              <div style={{ color: '#9a9892', fontSize: 12 }}>
+                信心指数：<span style={{ color: '#e8e6e3', fontWeight: 500 }}>{parsed.confidence_score ?? '-'}/100</span>
+              </div>
+              <div style={{ color: '#9a9892', fontSize: 12 }}>
+                周期：<span style={{ color: '#e8e6e3', fontWeight: 500 }}>{({ SHORT: '短期', MEDIUM: '中期', LONG: '长期' } as Record<string, string>)[parsed.time_horizon] || parsed.time_horizon || '-'}</span>
+              </div>
+            </div>
+
+            <div style={{
+              padding: 12, borderRadius: 8,
+              background: 'rgba(201, 168, 76, 0.06)',
+              border: '1px solid rgba(201, 168, 76, 0.12)',
+              color: '#cfcac1', fontSize: 13, lineHeight: 1.7,
+            }}>
+              {parsed.suggested_action || '暂无详细分析'}
+            </div>
+
+            {reportSections.length > 0 ? (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
+                {reportSections.map(section => (
+                  <div key={section.title} style={{
+                    padding: 12,
+                    borderRadius: 8,
+                    background: 'rgba(255,255,255,0.025)',
+                    border: '1px solid rgba(255,255,255,0.07)',
+                  }}>
+                    <div style={{ color: '#e8e6e3', fontWeight: 600, fontSize: 12, marginBottom: 6 }}>
+                      {section.title}
+                    </div>
+                    <div style={{ color: '#b0aea8', fontSize: 12, lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+                      {section.value}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {(parsed.target_price || parsed.stop_loss) ? (
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                {parsed.target_price ? (
+                  <div style={{
+                    padding: '8px 14px', borderRadius: 8,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                  }}>
+                    <div style={{ color: '#9a9892', fontSize: 11, marginBottom: 2 }}>目标价</div>
+                    <div style={{ color: '#e8e6e3', fontWeight: 600 }}>¥{Number(parsed.target_price).toFixed(3)}</div>
+                  </div>
+                ) : null}
+                {parsed.stop_loss ? (
+                  <div style={{
+                    padding: '8px 14px', borderRadius: 8,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                  }}>
+                    <div style={{ color: '#9a9892', fontSize: 11, marginBottom: 2 }}>止损价</div>
+                    <div style={{ color: redStyle.color, fontWeight: 600 }}>¥{Number(parsed.stop_loss).toFixed(3)}</div>
+                  </div>
+                ) : null}
+                {parsed.suggested_quantity ? (
+                  <div style={{
+                    padding: '8px 14px', borderRadius: 8,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                  }}>
+                    <div style={{ color: '#9a9892', fontSize: 11, marginBottom: 2 }}>建议操作份额</div>
+                    <div style={{ color: '#e8e6e3', fontWeight: 600 }}>{Number(parsed.suggested_quantity).toFixed(2)}</div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {parsed.summary ? (
+              <div style={{
+                padding: 10, borderRadius: 6,
+                background: 'linear-gradient(135deg, rgba(201, 168, 76, 0.08), rgba(201, 168, 76, 0.02))',
+                border: '1px solid rgba(201, 168, 76, 0.1)',
+                color: '#b0aea8', fontSize: 12, lineHeight: 1.6,
+              }}>
+                {parsed.summary}
+              </div>
+            ) : null}
+          </Space>
+        )
+      }
+
+      if (parsed?.recommendations?.asset_recommendations?.length) {
+        return (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            <div style={{
+              padding: 12, borderRadius: 8,
+              background: 'rgba(201, 168, 76, 0.06)',
+              border: '1px solid rgba(201, 168, 76, 0.12)',
+              color: '#cfcac1', fontSize: 13, lineHeight: 1.7,
+            }}>
+              {parsed.summary || '分析完成'}
+            </div>
+
+            {parsed.macro_analysis ? (
+              <div>
+                <div style={{ color: '#e8e6e3', fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                  宏观环境
+                </div>
+                <div style={{ color: '#9a9892', fontSize: 12, lineHeight: 1.7, padding: '0 2px' }}>
+                  {parsed.macro_analysis.global_overview ? (
+                    <div style={{ marginBottom: 6 }}>🌍 {parsed.macro_analysis.global_overview}</div>
+                  ) : null}
+                  {parsed.macro_analysis.china_economy ? (
+                    <div style={{ marginBottom: 6 }}>🇨🇳 {parsed.macro_analysis.china_economy}</div>
+                  ) : null}
+                  {parsed.macro_analysis.impact_assessment ? (
+                    <div style={{ marginBottom: 6 }}>📊 {parsed.macro_analysis.impact_assessment}</div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            <div>
+              <div style={{ color: '#e8e6e3', fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                逐项资产建议
+              </div>
+              {parsed.recommendations.asset_recommendations.map((r: any, i: number) => (
+                <div key={i} style={{
+                  padding: 12, borderRadius: 8, marginBottom: 8,
+                  background: 'rgba(255,255,255,0.02)',
+                  border: '1px solid rgba(255,255,255,0.06)',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <span style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 13 }}>
+                      {r.asset_name || r.asset_code}
+                    </span>
+                    <Tag color={suggestionColor(r.final_suggestion)}
+                      style={{ borderRadius: 6, border: 'none', color: '#fff', fontWeight: 500, fontSize: 11, padding: '0 10px' }}>
+                      {suggestionLabel(r.final_suggestion)}
+                    </Tag>
+                  </div>
+                  <div style={{ color: '#9a9892', fontSize: 12, lineHeight: 1.6 }}>{r.summary || r.suggested_action}</div>
+                  <div style={{ display: 'flex', gap: 12, marginTop: 6, fontSize: 11, color: '#5c5a55' }}>
+                    {r.confidence_score ? <span>信心 {r.confidence_score}/100</span> : null}
+                    {r.target_price ? <span>目标 ¥{Number(r.target_price).toFixed(3)}</span> : null}
+                    {r.stop_loss ? <span>止损 ¥{Number(r.stop_loss).toFixed(3)}</span> : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {parsed.recommendations.overall_strategy ? (() => {
+              const os = parsed.recommendations.overall_strategy
+              return (
+                <div>
+                  <div style={{ color: '#e8e6e3', fontWeight: 600, marginBottom: 8, fontSize: 13 }}>
+                    整体策略
+                  </div>
+                  <div style={{
+                    padding: 12, borderRadius: 8,
+                    background: 'rgba(201, 168, 76, 0.04)',
+                    border: '1px solid rgba(201, 168, 76, 0.1)',
+                    color: '#cfcac1', fontSize: 12, lineHeight: 1.7,
+                  }}>
+                    {os.overall_strategy ? <div style={{ marginBottom: 8 }}>{os.overall_strategy}</div> : null}
+                    {os.key_focus ? <div style={{ marginBottom: 8, color: '#9a9892' }}>关注方向：{os.key_focus}</div> : null}
+                    {os.suggested_cash_ratio != null ? (
+                      <div style={{ display: 'flex', gap: 16, marginTop: 8 }}>
+                        <Tag style={{ borderRadius: 6, border: '1px solid rgba(201,168,76,0.2)', background: 'transparent', color: '#c9a84c' }}>
+                          建议仓位 {(100 - os.suggested_cash_ratio).toFixed(0)}%
+                        </Tag>
+                        <Tag style={{ borderRadius: 6, border: '1px solid rgba(255,255,255,0.1)', background: 'transparent', color: '#9a9892' }}>
+                          现金比例 {os.suggested_cash_ratio}%
+                        </Tag>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              )
+            })() : null}
+          </Space>
+        )
+      }
+
+      return <Text style={{ whiteSpace: 'pre-wrap', color: '#cfcac1', lineHeight: 1.7 }}>{detail}</Text>
     } catch {
       return <Text style={{ whiteSpace: 'pre-wrap', color: '#cfcac1', lineHeight: 1.7 }}>{detail}</Text>
     }
@@ -723,6 +1072,15 @@ export default function Assets() {
         }
         extra={
           <Space>
+            <Button
+              icon={<ThunderboltOutlined />}
+              onClick={handleAnalyzeAll}
+              loading={aiCtx.state.isRunning}
+              size="small"
+              style={{ borderRadius: 10, fontSize: 13 }}
+            >
+              {aiCtx.state.isRunning ? '分析中...' : 'AI 全面分析'}
+            </Button>
             <Button
               icon={<ReloadOutlined />}
               onClick={refreshPrices}
@@ -817,6 +1175,9 @@ export default function Assets() {
         styles={{ body: { paddingTop: 24 } }}
       >
         <Form form={form} layout="vertical" size="large" onValuesChange={(changed) => {
+          if ('name' in changed && (changed.name || '').trim() !== lastAutoNameRef.current) {
+            lastAutoNameRef.current = null
+          }
           if ('code' in changed || 'market' in changed || 'asset_type' in changed) {
             scheduleLookup()
           }
@@ -910,9 +1271,10 @@ export default function Assets() {
           const chartData = buildChartData(assetDetail)
           const markers = getTradeMarkers(assetDetail, chartData)
           const asset = assetDetail.asset
-          const marketValue = asset.shares * (asset.current_price || asset.buy_price)
-          const pnl = asset.shares * ((asset.current_price || asset.buy_price) - asset.buy_price)
-          const pnlPct = asset.buy_price ? ((asset.current_price || asset.buy_price) - asset.buy_price) / asset.buy_price * 100 : 0
+          const effectivePrice = asset.current_price != null && asset.current_price > 0 ? asset.current_price : asset.buy_price
+          const marketValue = asset.shares * effectivePrice
+          const pnl = asset.shares * (effectivePrice - asset.buy_price)
+          const pnlPct = asset.buy_price ? (effectivePrice - asset.buy_price) / asset.buy_price * 100 : 0
           const panelStyle = {
             border: '1px solid rgba(201, 168, 76, 0.12)',
             borderRadius: 8,
@@ -931,7 +1293,7 @@ export default function Assets() {
                 {[
                   ['当前市值', formatMoney(marketValue)],
                   ['持仓份额', asset.shares.toFixed(2)],
-                  ['持仓成本', formatMoney(asset.buy_price, 3)],
+                  ['持仓成本', formatMoney(asset.buy_price, 4)],
                   ['浮动盈亏', `${pnl >= 0 ? '+' : ''}${formatMoney(pnl)} / ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%`],
                 ].map(([label, value]) => (
                   <Col xs={12} md={6} key={label}>
@@ -1042,7 +1404,7 @@ export default function Assets() {
                             <FileTextOutlined style={goldStyle} />
                             <Text strong style={{ color: '#e8e6e3' }}>最近一次 AI 分析报告</Text>
                           </Space>
-                          <Button onClick={handleRunAssetAnalysis} loading={aiAnalyzing} icon={<ReloadOutlined />} style={{ borderRadius: 10 }}>
+                          <Button onClick={handleRunAssetAnalysis} loading={aiCtx.state.isRunning} icon={<ReloadOutlined />} style={{ borderRadius: 10 }}>
                             更新分析
                           </Button>
                         </div>
@@ -1057,7 +1419,7 @@ export default function Assets() {
                           </Space>
                         ) : (
                           <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无该资产的 AI 分析报告">
-                            <Button type="primary" onClick={handleRunAssetAnalysis} loading={aiAnalyzing} icon={<FileTextOutlined />} style={{ borderRadius: 10 }}>
+                            <Button type="primary" onClick={handleRunAssetAnalysis} loading={aiCtx.state.isRunning} icon={<FileTextOutlined />} style={{ borderRadius: 10 }}>
                               生成分析报告
                             </Button>
                           </Empty>

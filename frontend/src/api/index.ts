@@ -14,7 +14,7 @@ export interface Asset {
   shares: number
   buy_price: number
   buy_date: string
-  current_price: number
+  current_price: number | null
   price_updated_at: string
   note: string
   created_at: string
@@ -99,6 +99,45 @@ export interface AgentAnalysisResponse {
   report: any
 }
 
+export interface InvestmentBudgetConfig {
+  id: string
+  platform: string
+  amount: number
+  currency: 'CNY' | 'HKD' | 'USD'
+  asset_types: string[]
+  markets: string[]
+}
+
+export interface InvestmentAdviceItem {
+  id: string
+  budget_id: string
+  platform: string
+  currency: string
+  currency_label: string
+  market: string
+  market_label: string
+  asset_type: string
+  asset_type_label: string
+  code: string
+  name: string
+  trade_type: 'BUY' | 'SELL'
+  trade_type_label: string
+  shares: number
+  price: number
+  estimated_amount: number
+  reason: string
+  confidence_score: number
+  risk_note: string
+  source: string
+  asset_id: number | null
+}
+
+export interface InvestmentAdviceResponse {
+  summary: string
+  advice: InvestmentAdviceItem[]
+  budget_status: any[]
+}
+
 export const dashboardApi = {
   get: () => api.get<DashboardData>('/dashboard').then(r => r.data),
 }
@@ -130,6 +169,14 @@ export const analysisApi = {
     api.post<AgentAnalysisResponse>('/analysis/agent-run', req || { goal: '全面分析投资组合' }).then(r => r.data),
 }
 
+export const investmentAdviceApi = {
+  latest: () => api.get<InvestmentAdviceResponse>("/investment-advice/latest").then(r => r.data),
+  run: () => api.post<InvestmentAdviceResponse>('/investment-advice/run').then(r => r.data),
+  accept: (advice: InvestmentAdviceItem) =>
+    api.post('/investment-advice/accept', { advice }).then(r => r.data),
+  check: () => api.get<{configured: boolean; budget_count: number}>('/investment-advice/check').then(r => r.data),
+}
+
 export const settingsApi = {
   get: (key: string) =>
     api.get<SettingsResponse>(`/settings/${key}`).then(r => r.data),
@@ -139,6 +186,22 @@ export const settingsApi = {
 
 export const schedulerApi = {
   config: () => api.get<any>('/scheduler/config').then(r => r.data),
+}
+
+export interface ParallelConfig {
+  enabled: boolean
+  max_workers: number
+  batch_size: number
+  ai_timeout_seconds: number
+  parallel_skills: boolean
+  parallel_assets: boolean
+  parallel_dashboard_steps: boolean
+}
+
+export const parallelApi = {
+  getConfig: () => api.get<ParallelConfig>('/settings/parallel-config').then(r => r.data),
+  saveConfig: (config: Partial<ParallelConfig>) =>
+    api.post<{ message: string; config: ParallelConfig }>('/settings/parallel-config', config).then(r => r.data),
 }
 
 export const settingsApiFull = {

@@ -6,8 +6,10 @@ import {
   AimOutlined,
   AppstoreOutlined,
   ScanOutlined,
+  BulbOutlined,
 } from '@ant-design/icons'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
+import AIProgressOverlay from './AIProgressOverlay'
 
 const { Header, Sider, Content } = Layout
 
@@ -31,6 +33,11 @@ const menuItems = [
     key: '/targets',
     icon: <AimOutlined />,
     label: '我的标的',
+  },
+  {
+    key: '/investment-advice',
+    icon: <BulbOutlined />,
+    label: 'AI 投资建议',
   },
   {
     key: '/skills',
@@ -167,6 +174,9 @@ export default function AppLayout() {
           </div>
         </Content>
       </Layout>
+
+      {/* Global AI Progress Overlay - persists across page navigation */}
+      <AIProgressOverlay />
     </Layout>
   )
 }

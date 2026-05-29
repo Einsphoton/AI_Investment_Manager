@@ -15,7 +15,7 @@ class Asset(Base):
     shares = Column(Float, nullable=False)
     buy_price = Column(Float, nullable=False)
     buy_date = Column(String(20), nullable=False)
-    current_price = Column(Float, default=0.0)
+    current_price = Column(Float, default=None, nullable=True)
     price_updated_at = Column(String(20), default="")
     note = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -42,6 +42,7 @@ class AnalysisRecord(Base):
     id = Column(Integer, primary_key=True, index=True)
     summary = Column(Text, default="")
     detail = Column(Text, default="")
+    asset_id = Column(Integer, default=None, nullable=True, index=True)
     total_market_value = Column(Float, default=0.0)
     total_cost = Column(Float, default=0.0)
     total_pnl = Column(Float, default=0.0)
@@ -87,3 +88,13 @@ class Target(Base):
     last_analyzed_at = Column(String(20), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class InvestmentAdviceRecord(Base):
+    __tablename__ = "investment_advice_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    summary = Column(Text, default="")
+    advice_json = Column(Text, default="[]")
+    budget_status_json = Column(Text, default="[]")
+    created_at = Column(DateTime, default=datetime.utcnow)

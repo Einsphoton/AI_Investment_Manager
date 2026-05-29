@@ -10,29 +10,31 @@ import requests
 SINA = 'sina'
 TENCENT = 'tencent'
 EASTMONEY = 'eastmoney'
+TIANTIAN = 'tiantian'
 YAHOO = 'yahoo'
 
 PROVIDER_LABELS = {
     SINA: '新浪财经',
     TENCENT: '腾讯财经',
     EASTMONEY: '东方财富',
+    TIANTIAN: '天天基金',
     YAHOO: 'Yahoo Finance',
 }
 
 STOCK_PROVIDER_OPTIONS = {
     'A': [SINA, TENCENT, EASTMONEY],
     'HK': [SINA, TENCENT, YAHOO],
-    'US': [YAHOO, SINA],
+    'US': [YAHOO, SINA, TENCENT],
 }
 
 FUND_PROVIDER_OPTIONS = {
-    'A': [EASTMONEY],
+    'A': [TIANTIAN, EASTMONEY, TENCENT, SINA],
     'HK': [EASTMONEY],
     'US': [YAHOO],
 }
 
 DEFAULT_STOCK_PROVIDERS = {'A': SINA, 'HK': SINA, 'US': YAHOO}
-DEFAULT_FUND_PROVIDERS = {'A': EASTMONEY, 'HK': EASTMONEY, 'US': YAHOO}
+DEFAULT_FUND_PROVIDERS = {'A': TIANTIAN, 'HK': EASTMONEY, 'US': YAHOO}
 
 
 def parse_float(s) -> Optional[float]:
@@ -209,24 +211,67 @@ def _tencent_stock_quote(code: str, market: str) -> Optional[dict]:
         return None
 
 
+def _eastmoney_fund_latest_nav(code: str) -> Optional[float]:
+    """Fetch the latest unit NAV (DWJZ) for a fund from the history API."""
+    code = _base_code(code)
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Referer': 'https://fund.eastmoney.com/',
+        }
+        resp = requests.get(
+            'https://api.fund.eastmoney.com/f10/lsjz',
+            params={'fundCode': code, 'pageIndex': 1, 'pageSize': 1},
+            headers=headers, timeout=10,
+        )
+        data = resp.json()
+        lsjz = data.get('Data', {}).get('LSJZList', [])
+        if lsjz:
+            return parse_float(lsjz[0].get('DWJZ'))
+    except Exception as e:
+        print(f"[EastMoney Fund Latest NAV] {code}: {e}")
+    return None
+
+
 def _eastmoney_fund_quote(code: str) -> Optional[dict]:
     code = _base_code(code)
     try:
         resp = requests.get(f'https://fundgz.1234567.com.cn/js/{code}.js', timeout=5)
         m = re.search(r'jsonpgz\((.+)\)', resp.text)
         if not m:
+            nav = _eastmoney_fund_latest_nav(code)
+            if nav is not None:
+                return {
+                    'name': '',
+                    'code': code,
+                    'current_price': nav,
+                    'nav': nav,
+                    'nav_date': '',
+                }
             return None
         data = json.loads(m.group(1))
+        gsz = parse_float(data.get('gsz'))
+        dwjz = parse_float(data.get('dwjz'))
+        current_price = gsz if (gsz is not None and gsz > 0) else dwjz
         return {
             'name': data.get('name', ''),
             'code': data.get('fundcode', code),
-            'current_price': parse_float(data.get('gsz')),
-            'nav': parse_float(data.get('dwjz')),
+            'current_price': current_price,
+            'nav': dwjz,
             'nav_date': data.get('jzrq', ''),
             'change_pct': parse_float(data.get('gszzl')),
         }
     except Exception as e:
         print(f"[EastMoney Fund] {code}: {e}")
+        nav = _eastmoney_fund_latest_nav(code)
+        if nav is not None:
+            return {
+                'name': '',
+                'code': code,
+                'current_price': nav,
+                'nav': nav,
+                'nav_date': '',
+            }
         return None
 
 
@@ -310,6 +355,42 @@ def _eastmoney_fund_search(keyword: str, limit: int = 10) -> list[dict]:
         return []
 
 
+def _eastmoney_fund_profile_name(code: str) -> Optional[str]:
+    code = _base_code(code)
+    try:
+        resp = requests.get(
+            f'https://fund.eastmoney.com/pingzhongdata/{code}.js',
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Referer': 'https://fund.eastmoney.com/',
+            },
+            timeout=10,
+        )
+        m = re.search(r'var\s+fS_name\s*=\s*["\'](.*?)["\'];', resp.text, re.S)
+        if m:
+            return m.group(1).strip() or None
+    except Exception as e:
+        print(f"[EastMoney Fund Profile Name] {code}: {e}")
+    return None
+
+
+def _eastmoney_fund_lookup_name(code: str) -> Optional[str]:
+    base = _base_code(code)
+
+    quote_data = _eastmoney_fund_quote(base)
+    if quote_data and quote_data.get('name'):
+        return quote_data['name']
+
+    search_results = _eastmoney_fund_search(base, limit=5)
+    exact = next((item for item in search_results if item.get('code') == base and item.get('name')), None)
+    if exact:
+        return exact['name']
+    if len(search_results) == 1 and search_results[0].get('name'):
+        return search_results[0]['name']
+
+    return _eastmoney_fund_profile_name(base)
+
+
 def get_provider(asset_type: str, market: str, providers: Optional[dict] = None) -> str:
     type_key = 'fund' if 'fund' in (asset_type or '') else 'stock'
     defaults = DEFAULT_FUND_PROVIDERS if type_key == 'fund' else DEFAULT_STOCK_PROVIDERS
@@ -324,7 +405,7 @@ def lookup_name(code: str, market: str, asset_type: str, providers: Optional[dic
 
     result = None
     if is_fund:
-        result = _eastmoney_fund_quote(code)
+        return _eastmoney_fund_lookup_name(code)
     elif provider == SINA:
         result = _sina_stock_quote(code, market)
     elif provider == TENCENT:
@@ -337,15 +418,10 @@ def lookup_name(code: str, market: str, asset_type: str, providers: Optional[dic
     if result and result.get('name'):
         return result['name']
 
-    if is_fund:
-        result = _eastmoney_fund_quote(code)
+    for fn in [_sina_stock_quote, _tencent_stock_quote, _yahoo_quote]:
+        result = fn(code, market)
         if result and result.get('name'):
             return result['name']
-    else:
-        for fn in [_sina_stock_quote, _tencent_stock_quote, _yahoo_quote]:
-            result = fn(code, market)
-            if result and result.get('name'):
-                return result['name']
     return None
 
 
@@ -355,9 +431,32 @@ def get_quote(code: str, market: str, asset_type: str, providers: Optional[dict]
 
     result = None
     if is_fund:
-        result = _eastmoney_fund_quote(code)
-        if not result:
-            result = _yahoo_quote(code, market)
+        def tiantian():
+            return _eastmoney_fund_quote(code)
+
+        def tencent():
+            return _tencent_stock_quote(code, market)
+
+        def sina():
+            return _sina_stock_quote(code, market)
+
+        def yahoo():
+            return _yahoo_quote(code, market)
+
+        # 场外基金优先走天天基金净值估算；场内基金若选择腾讯/新浪，可先取交易所行情。
+        if provider == TENCENT:
+            sources = [tencent, tiantian, yahoo]
+        elif provider == SINA:
+            sources = [sina, tiantian, yahoo]
+        elif provider == YAHOO:
+            sources = [yahoo, tiantian]
+        else:
+            sources = [tiantian, yahoo]
+
+        for fn in sources:
+            result = fn()
+            if result:
+                break
     else:
         fns = {SINA: _sina_stock_quote, TENCENT: _tencent_stock_quote, YAHOO: _yahoo_quote}
         result = fns.get(provider, _sina_stock_quote)(code, market)
@@ -531,10 +630,13 @@ def get_history(code: str, market: str, asset_type: str, providers: Optional[dic
     provider = get_provider(asset_type, market, providers)
 
     if is_fund:
-        sources = [
+        sources = []
+        if provider == TENCENT:
+            sources.append(lambda: _tencent_stock_history(code, market))
+        sources.extend([
             lambda: _eastmoney_fund_history(code),
             lambda: _yahoo_history(code, market),
-        ]
+        ])
         for fn in sources:
             result = fn()
             if result:

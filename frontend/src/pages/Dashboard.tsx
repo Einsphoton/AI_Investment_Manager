@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react'
+import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
-  Card, Row, Col, Statistic, Button, Spin, Typography, Space, Table, Tag, Switch
+  Card, Row, Col, Statistic, Button, Spin, Typography, Space, Table, Tag, Switch, message
 } from 'antd'
 import {
   ArrowUpOutlined, ArrowDownOutlined, ThunderboltOutlined,
   DollarOutlined, WalletOutlined, RiseOutlined, BarChartOutlined
 } from '@ant-design/icons'
-import { dashboardApi, analysisApi, assetsApi, DashboardData, AnalysisRecord, Asset } from '../api'
+import { dashboardApi, analysisApi, assetsApi, targetsApi, investmentAdviceApi, parallelApi, DashboardData, AnalysisRecord, Asset } from '../api'
 import { useNavigate } from 'react-router-dom'
 
 const { Text, Paragraph } = Typography
@@ -19,20 +20,30 @@ export default function Dashboard() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
   const [analysis, setAnalysis] = useState<AnalysisRecord | null>(null)
   const [loading, setLoading] = useState(true)
-  const [analyzing, setAnalyzing] = useState(false)
+  const aiCtx = useAIWorkContext()
   const [includeTargets, setIncludeTargets] = useState(() => {
     return localStorage.getItem('dashboard_include_targets') === 'true'
   })
+  const [includeAdvice, setIncludeAdvice] = useState(() => {
+    return localStorage.getItem('dashboard_include_advice') === 'true'
+  })
+  const [parallelConfigEnabled, setParallelConfigEnabled] = useState(false)
+  const [configLoaded, setConfigLoaded] = useState(false)
   const [assets, setAssets] = useState<Asset[]>([])
   const navigate = useNavigate()
 
   const fetchData = async () => {
     try {
-      const [dash, assetsData, latestAnalysis] = await Promise.all([
+      const [dash, assetsData, latestAnalysis, parallelCfg] = await Promise.all([
         dashboardApi.get(),
         assetsApi.list(),
         analysisApi.latest().catch(() => null),
+        parallelApi.getConfig().catch(() => null),
       ])
+      if (parallelCfg) {
+        setParallelConfigEnabled(parallelCfg.parallel_dashboard_steps)
+      }
+      setConfigLoaded(true)
       setDashboard(dash)
       setAssets(assetsData)
       setAnalysis(latestAnalysis)
@@ -47,16 +58,199 @@ export default function Dashboard() {
     fetchData()
   }, [])
 
+  const getErrorDetail = (e: any): string => {
+    return e?.response?.data?.detail || e?.message || '未知错误'
+  }
+
   const runAnalysis = async () => {
-    setAnalyzing(true)
+    aiCtx.startTask('一键 AI 分析')
     try {
-      const result = await analysisApi.run(includeTargets)
-      setAnalysis(result)
-      await fetchData()
-    } catch (e) {
-      console.error('Analysis failed', e)
-    } finally {
-      setAnalyzing(false)
+      // Pre-check if advice is configured (non-SSE, lightweight call)
+      let adviceConfigured = includeAdvice
+      if (includeAdvice) {
+        try {
+          const check = await investmentAdviceApi.check()
+          adviceConfigured = check.configured
+          if (!check.configured) {
+            aiCtx.addLog('⏭️ AI 投资建议已跳过（未配置平台额度）', 'info')
+          }
+        } catch {
+          adviceConfigured = false
+          aiCtx.addLog('⏭️ AI 投资建议跳过（检查配置失败）', 'info')
+        }
+      }
+
+      // Use parallel UI when parallel_dashboard_steps is enabled AND there are multiple steps
+      const hasMultipleSteps = configLoaded && parallelConfigEnabled && (includeTargets || adviceConfigured)
+      if (hasMultipleSteps) {
+        // === PARALLEL MODE with streaming sub-tasks ===
+        const subtaskIds: string[] = []
+        aiCtx.setParallelMode(true)
+
+        const tasks: { id: string; name: string; icon: string; run: () => Promise<void> }[] = []
+        tasks.push({
+          id: 'portfolio', name: '资产分析', icon: '📊',
+          run: async () => {
+            aiCtx.updateSubTask('portfolio', { status: 'running', thinking: '正在通过实时流分析组合...', progress: 5 })
+            try {
+              const result = await aiCtx.streamSSE('/api/analysis/run-stream')
+              // SSE completed - record was saved to DB, fetch the full record from API
+              if (result && result.summary) {
+                try {
+                  const fullRecord = await analysisApi.latest()
+                  setAnalysis(fullRecord)
+                } catch {
+                  // Fallback: use the SSE result if API fetch fails
+                  setAnalysis(result as any)
+                }
+              }
+            } catch (e: any) {
+              // User cancelled - skip fallback
+              if (e.isCancelled) throw e
+              // SSE failed, fallback to regular API
+              console.warn('SSE stream failed, falling back to regular API', e)
+              try {
+                const result = await analysisApi.run(false)
+                setAnalysis(result)
+              } catch (e2: any) {
+                aiCtx.updateSubTask('portfolio', { status: 'error', progress: 0, thinking: '分析失败' })
+                aiCtx.addLog('❌ AI 资产分析失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error', '资产分析')
+                return
+              }
+            }
+            aiCtx.updateSubTask('portfolio', { status: 'completed', progress: 100, thinking: '分析完成' })
+            aiCtx.addLog('✅ AI 资产分析完成', 'success', '资产分析')
+          },
+        })
+        if (includeTargets) {
+          tasks.push({
+            id: 'targets', name: '标的分析', icon: '🎯',
+            run: async () => {
+              aiCtx.updateSubTask('targets', { status: 'running', thinking: '正在通过实时流分析标的...', progress: 5 })
+              try {
+                const result = await aiCtx.streamSSE('/api/targets/ai-analyze-stream')
+                if (result && result.summary) {
+                  aiCtx.addLog('✅ AI 标的分析完成', 'success', '标的分析')
+                }
+              } catch (e: any) {
+                // User cancelled - skip fallback
+                if (e.isCancelled) throw e
+                console.warn('SSE stream for targets failed, falling back to regular API', e)
+                try {
+                  await targetsApi.aiAnalyze()
+                } catch (e2: any) {
+                  aiCtx.updateSubTask('targets', { status: 'error', progress: 0, thinking: '分析失败' })
+                  aiCtx.addLog('❌ AI 标的分析失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error', '标的分析')
+                  return
+                }
+              }
+              aiCtx.updateSubTask('targets', { status: 'completed', progress: 100, thinking: '分析完成' })
+              aiCtx.addLog('✅ AI 推荐标的完成', 'success', '标的分析')
+            },
+          })
+        }
+        if (adviceConfigured) {
+          tasks.push({
+            id: 'advice', name: '投资建议', icon: '💡',
+            run: async () => {
+              aiCtx.updateSubTask('advice', { status: 'running', thinking: '正在通过实时流生成建议...', progress: 5 })
+              try {
+                const result = await aiCtx.streamSSE('/api/investment-advice/run-stream')
+                if (result && result.summary) {
+                  aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
+                }
+              } catch (e: any) {
+                // User cancelled - skip fallback
+                if (e.isCancelled) throw e
+                // Budget/config not configured - skip gracefully
+                const errMsg = e?.message || ''
+                if (errMsg.includes('请先配置') || errMsg.includes('平台投资额度')) {
+                  aiCtx.updateSubTask('advice', { status: 'completed', progress: 100, thinking: '已跳过（未配置）' })
+                  aiCtx.addLog('⏭️ AI 投资建议已跳过（未配置平台额度）', 'info', '投资建议')
+                  return
+                }
+                console.warn('SSE stream for advice failed, falling back to regular API', e)
+                try {
+                  await investmentAdviceApi.run()
+                  aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
+                } catch (e2: any) {
+                  aiCtx.updateSubTask('advice', { status: 'error', progress: 0, thinking: '建议生成失败' })
+                  aiCtx.addLog('❌ AI 投资建议失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error', '投资建议')
+                  return
+                }
+              }
+              aiCtx.updateSubTask('advice', { status: 'completed', progress: 100, thinking: '建议已生成' })
+            },
+          })
+        }
+
+        for (const t of tasks) {
+          aiCtx.registerSubTask(t.id, t.name, t.icon)
+          subtaskIds.push(t.id)
+        }
+        await new Promise(r => setTimeout(r, 200))
+        await Promise.all(tasks.map(t => t.run()))
+        // Complete task early so overlay shows completion immediately
+        aiCtx.completeTask()
+        // Then fetch fresh data in background
+        await fetchData()
+      } else {
+        // === SEQUENTIAL MODE with REAL SSE streaming ===
+        aiCtx.addLog('正在连接 AI 分析引擎...', 'info')
+        try {
+          const result = await aiCtx.streamSSE('/api/analysis/run-stream')
+          if (result && result.summary) {
+            try {
+              const fullRecord = await analysisApi.latest()
+              setAnalysis(fullRecord)
+            } catch {
+              setAnalysis(result as any)
+            }
+          }
+        } catch (e: any) {
+          // User cancelled - skip fallback
+          if (e.isCancelled) throw e
+          // Fallback: try regular API if SSE fails
+          console.warn('SSE stream failed, falling back to regular API', e)
+          try {
+            const result = await analysisApi.run(false)
+            setAnalysis(result)
+          } catch (e2: any) {
+            aiCtx.addLog('❌ AI 资产分析失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error')
+          }
+        }
+        aiCtx.addLog('✅ AI 资产分析完成', 'success')
+
+        if (includeTargets) {
+          try {
+            await targetsApi.aiAnalyze()
+            aiCtx.addLog('✅ AI 推荐标的完成', 'success')
+          } catch (e: any) {
+            aiCtx.addLog(`❌ 标的分析失败`, 'error')
+          }
+        }
+
+        if (adviceConfigured) {
+          try {
+            await investmentAdviceApi.run()
+            aiCtx.addLog('✅ AI 投资建议已生成', 'success')
+          } catch (e: any) {
+            const msg = e?.response?.data?.detail || e?.message || ''
+            if (msg.includes('请先配置') || msg.includes('平台投资额度')) {
+              aiCtx.addLog('⏭️ AI 投资建议已跳过（未配置平台额度）', 'info')
+            } else {
+              aiCtx.addLog('❌ 投资建议生成失败', 'error')
+            }
+          }
+        }
+
+        // Complete task early so overlay shows completion immediately
+        aiCtx.completeTask()
+        await fetchData()
+      }
+    } catch (e: any) {
+      const errMsg = getErrorDetail(e)
+      aiCtx.failTask(errMsg)
     }
   }
 
@@ -132,14 +326,16 @@ export default function Dashboard() {
     {
       title: '市值', key: 'mv',
       render: (_: any, r: Asset) => {
-        const mv = r.shares * (r.current_price || r.buy_price)
+        const effectivePrice = r.current_price != null && r.current_price > 0 ? r.current_price : r.buy_price
+        const mv = r.shares * effectivePrice
         return <span style={{ fontWeight: 500 }}>¥{mv.toFixed(2)}</span>
       },
     },
     {
       title: '盈亏', key: 'pnl',
       render: (_: any, r: Asset) => {
-        const pnl = r.shares * ((r.current_price || r.buy_price) - r.buy_price)
+        const effectivePrice = r.current_price != null && r.current_price > 0 ? r.current_price : r.buy_price
+        const pnl = r.shares * (effectivePrice - r.buy_price)
         const color = pnl >= 0 ? greenStyle.color : redStyle.color
         return (
           <span style={{ color, fontWeight: 600 }}>
@@ -163,28 +359,39 @@ export default function Dashboard() {
             type="primary"
             size="large"
             icon={<ThunderboltOutlined />}
-            loading={analyzing}
+            loading={aiCtx.state.isRunning}
             onClick={runAnalysis}
             style={{ borderRadius: 10, fontWeight: 600, height: 44, paddingInline: 28, fontSize: 15 }}
           >
-            {analyzing ? '分析中...' : '一键 AI 分析'}
+            {aiCtx.state.isRunning ? '分析中...' : '一键 AI 分析'}
           </Button>
           <Space>
             <Switch
               checked={includeTargets}
-              onChange={checked => {
-                setIncludeTargets(checked)
-                localStorage.setItem('dashboard_include_targets', String(checked))
-              }}
+              onChange={checked => { setIncludeTargets(checked); localStorage.setItem('dashboard_include_targets', String(checked)) }}
               size="small"
             />
             <Text style={{ color: '#9a9892', fontSize: 13, userSelect: 'none' }}>
               连带推荐标的
             </Text>
+            <Switch
+              checked={includeAdvice}
+              onChange={checked => { setIncludeAdvice(checked); localStorage.setItem('dashboard_include_advice', String(checked)) }}
+              size="small"
+            />
+            <Text style={{ color: '#9a9892', fontSize: 13, userSelect: 'none' }}>
+              连带 AI 投资建议
+            </Text>
           </Space>
         </Space>
         <Text style={{ color: '#5c5a55', fontSize: 12 }}>
-          {includeTargets ? '分析完成后将自动更新标的推荐' : '仅分析现有持仓'}
+          {includeTargets && includeAdvice
+            ? '分析 → 推荐标的 → 投资建议'
+            : includeTargets
+            ? '分析完成后将自动更新标的推荐'
+            : includeAdvice
+            ? '分析完成后将自动生成投资建议'
+            : '仅分析现有持仓'}
         </Text>
       </div>
 

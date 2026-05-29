@@ -1,10 +1,12 @@
 from __future__ import annotations
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from openai import OpenAI
 
+from parallel_executor import get_parallel_config
 from .skill import Skill, SkillContext
 from .skills import (
     MacroAnalysisSkill, StockAnalysisSkill, TushareFinanceSkill,
@@ -94,12 +96,38 @@ class AgentHarness:
         except Exception:
             return AnalysisPlan(steps=list(self.skills.keys()))
 
+    def _get_skill_deps(self) -> dict[str, set[str]]:
+        """Get a set of dependencies for each skill."""
+        deps: dict[str, set[str]] = {}
+        for name, skill in self.skills.items():
+            deps[name] = set(skill.dependencies)
+        return deps
+
     def execute(self, goal: str, asset_data: list[dict] | None = None) -> dict:
+        """Execute analysis plan, optionally with parallel skill execution."""
         self.results = {"goal": goal, "asset_data": asset_data or [], "steps": []}
         plan = self.plan_analysis(goal, asset_data)
         self.ctx.data["asset_data"] = asset_data or []
         self.ctx.data["goal"] = goal
 
+        # Check if parallel execution is enabled
+        parallel_enabled = False
+        try:
+            if self.ctx.db_session:
+                pcfg = get_parallel_config(self.ctx.db_session)
+                parallel_enabled = pcfg.enabled and pcfg.parallel_skills and pcfg.max_workers > 1
+        except Exception:
+            pass
+
+        if parallel_enabled:
+            self._execute_parallel(plan)
+        else:
+            self._execute_sequential(plan)
+
+        return self._compile_report()
+
+    def _execute_sequential(self, plan: AnalysisPlan):
+        """Execute skills sequentially in plan order."""
         for step_name in plan.steps:
             if step_name not in self.skills:
                 continue
@@ -119,7 +147,80 @@ class AgentHarness:
             self.results["steps"].append(step_name)
             self.ctx.data[step_name] = result
 
-        return self._compile_report()
+    def _execute_parallel(self, plan: AnalysisPlan):
+        """
+        Execute skills in parallel levels based on dependency analysis.
+        Skills that only depend on already-completed skills run concurrently.
+        """
+        # Only consider skills that are in the plan
+        active_skills = {name: self.skills[name] for name in plan.steps if name in self.skills}
+
+        if not active_skills:
+            return
+
+        # Get execution levels based on dependencies
+        deps = {name: set(s.dependencies) & set(active_skills.keys())
+                for name, s in active_skills.items()}
+        levels: list[list[str]] = []
+        remaining = set(active_skills.keys())
+        processed: set[str] = set()
+
+        while remaining:
+            current_level = [
+                name for name in remaining
+                if deps[name].issubset(processed)
+            ]
+            if not current_level:
+                current_level = list(remaining)
+                break
+            levels.append(current_level)
+            processed.update(current_level)
+            remaining -= set(current_level)
+
+        max_workers = 3
+        try:
+            if self.ctx.db_session:
+                pcfg = get_parallel_config(self.ctx.db_session)
+                max_workers = min(pcfg.max_workers, 6)
+        except Exception:
+            pass
+
+        # Execute level by level
+        for level in levels:
+            if len(level) <= 1:
+                # Single skill - execute directly
+                name = level[0]
+                skill = active_skills[name]
+                for dep in skill.dependencies:
+                    dep_result = self.results.get(dep)
+                    if dep_result:
+                        self.ctx.data[dep] = dep_result
+                try:
+                    self.results[name] = skill.execute(self.ctx)
+                except Exception as e:
+                    self.results[name] = {"error": str(e), "fallback": True}
+                self.results["steps"].append(name)
+                self.ctx.data[name] = self.results[name]
+            else:
+                # Multiple skills at same level - execute in parallel
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(level))) as executor:
+                    def run_skill(skill_name: str) -> tuple[str, dict]:
+                        s = active_skills[skill_name]
+                        for dep in s.dependencies:
+                            dep_result = self.results.get(dep)
+                            if dep_result:
+                                self.ctx.data[dep] = dep_result
+                        try:
+                            return skill_name, s.execute(self.ctx)
+                        except Exception as e:
+                            return skill_name, {"error": str(e), "fallback": True}
+
+                    futures = {executor.submit(run_skill, name): name for name in level}
+                    for future in as_completed(futures):
+                        name, result = future.result()
+                        self.results[name] = result
+                        self.results["steps"].append(name)
+                        self.ctx.data[name] = result
 
     def _compile_report(self) -> dict:
         report = {

@@ -13,7 +13,7 @@ class AssetCreate(BaseModel):
     shares: float
     buy_price: float
     buy_date: str
-    current_price: float = 0.0
+    current_price: Optional[float] = None
     note: str = ""
 
 
@@ -40,7 +40,7 @@ class AssetResponse(BaseModel):
     shares: float
     buy_price: float
     buy_date: str
-    current_price: float
+    current_price: Optional[float]
     price_updated_at: str
     note: str
     created_at: datetime
@@ -193,6 +193,16 @@ class AgentAnalysisRequest(BaseModel):
 class AgentAnalysisResponse(BaseModel):
     summary: str
     report: dict
+
+
+class InvestmentAdviceAcceptRequest(BaseModel):
+    advice: dict
+
+
+class InvestmentAdviceResponse(BaseModel):
+    summary: str
+    advice: list[dict] = []
+    budget_status: list[dict] = []
 
 
 class MarketLookupRequest(BaseModel):

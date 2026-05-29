@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
   Card, Table, Button, Modal, Form, Input, Select, Space,
   Tag, message, Row, Col, Typography, Tooltip, Popconfirm, Popover,
@@ -488,7 +489,7 @@ function AnalysisPopover({ target }: { target: Target }) {
 export default function Targets() {
   const [targets, setTargets] = useState<Target[]>([])
   const [loading, setLoading] = useState(true)
-  const [analyzing, setAnalyzing] = useState(false)
+  const aiCtx = useAIWorkContext()
   const [modalOpen, setModalOpen] = useState(false)
   const [clearModalOpen, setClearModalOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
@@ -584,18 +585,29 @@ export default function Targets() {
   }
 
   const handleAiAnalyze = async () => {
-    setAnalyzing(true)
+    aiCtx.startTask('AI 标的投资建议')
     try {
-      const result = await targetsApi.aiAnalyze({
-        markets: marketFilter,
-        asset_types: assetTypeFilter,
-      })
-      message.success(result.summary || 'AI 标的分析完成')
-      fetchTargets()
+      aiCtx.addLog('正在实时分析标的...', 'info')
+      try {
+        const result = await aiCtx.streamSSE('/api/targets/ai-analyze-stream')
+        await fetchTargets()
+        if (result && result.summary) {
+          aiCtx.addLog(`✅ ${result.summary}`, 'success')
+        }
+      } catch (e: any) {
+        // Fallback
+        const result = await targetsApi.aiAnalyze({
+          markets: marketFilter,
+          asset_types: assetTypeFilter,
+        })
+        await fetchTargets()
+        if (result && result.summary) {
+          aiCtx.addLog(`✅ ${result.summary}`, 'success')
+        }
+      }
+      aiCtx.completeTask()
     } catch (e: any) {
-      message.error(e?.response?.data?.detail || '分析失败')
-    } finally {
-      setAnalyzing(false)
+      aiCtx.failTask(e?.response?.data?.detail || '分析失败')
     }
   }
 
@@ -781,7 +793,7 @@ export default function Targets() {
             <Button
               type="primary"
               icon={<ThunderboltOutlined />}
-              loading={analyzing}
+              loading={aiCtx.state.isRunning}
               onClick={handleAiAnalyze}
               style={{ borderRadius: 10, height: 36, fontWeight: 500 }}
             >

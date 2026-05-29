@@ -7,9 +7,9 @@ import {
   ApiOutlined, ClockCircleOutlined, DownloadOutlined, UploadOutlined,
   KeyOutlined, SettingOutlined, SafetyOutlined, RobotOutlined, FileTextOutlined,
   DatabaseOutlined, StockOutlined, BankOutlined, ReloadOutlined, DeleteOutlined,
-  WarningOutlined
+  WarningOutlined, PlusOutlined, WalletOutlined
 } from '@ant-design/icons'
-import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, MarketProviders } from '../api'
+import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, parallelApi, MarketProviders, InvestmentBudgetConfig, ParallelConfig } from '../api'
 
 const { Text, Paragraph } = Typography
 const goldStyle = { color: '#c9a84c' }
@@ -39,6 +39,18 @@ const MARKET_OPTIONS = [
   { value: 'A', label: 'A股' },
   { value: 'HK', label: '港股' },
   { value: 'US', label: '美股' },
+]
+
+const CURRENCY_OPTIONS = [
+  { value: 'CNY', label: '人民币' },
+  { value: 'HKD', label: '港元' },
+  { value: 'USD', label: '美元' },
+]
+
+const ASSET_TYPE_OPTIONS = [
+  { value: 'stock', label: '股票' },
+  { value: 'onshore_fund', label: '场内基金' },
+  { value: 'offshore_fund', label: '场外基金' },
 ]
 
 const normalizeModelOptions = (models: string[]) => {
@@ -80,6 +92,58 @@ export default function Settings() {
   const [aiModelOptions, setAiModelOptions] = useState<string[]>([])
   const [ocrModelOptions, setOcrModelOptions] = useState<string[]>([])
   const [loadingModels, setLoadingModels] = useState<'ai' | 'ocr' | null>(null)
+  const [budgetConfigs, setBudgetConfigs] = useState<InvestmentBudgetConfig[]>([])
+  const [parallelConfig, setParallelConfig] = useState<ParallelConfig>({
+    enabled: true,
+    max_workers: 3,
+    batch_size: 5,
+    ai_timeout_seconds: 120,
+    parallel_skills: true,
+    parallel_assets: true,
+    parallel_dashboard_steps: false,
+  })
+
+  const normalizeBudgetConfigs = (items: any[]): InvestmentBudgetConfig[] => {
+    return (items || []).map((item, idx) => ({
+      id: String(item.id || `budget-${Date.now()}-${idx}`),
+      platform: String(item.platform || ''),
+      amount: Number(item.amount || 0),
+      currency: (item.currency || 'CNY') as InvestmentBudgetConfig['currency'],
+      asset_types: Array.isArray(item.asset_types) ? item.asset_types : [],
+      markets: Array.isArray(item.markets) ? item.markets : [],
+    }))
+  }
+
+  const saveBudgetConfigs = async (configs: InvestmentBudgetConfig[]) => {
+    setBudgetConfigs(configs)
+    await settingsApi.update('investment_budget_configs', JSON.stringify(configs))
+  }
+
+  const addBudgetConfig = async () => {
+    const next = [
+      ...budgetConfigs,
+      {
+        id: `budget-${Date.now()}`,
+        platform: '微信理财通',
+        amount: 0,
+        currency: 'CNY' as const,
+        asset_types: ['stock', 'onshore_fund', 'offshore_fund'],
+        markets: ['A'],
+      },
+    ]
+    await saveBudgetConfigs(next)
+    message.success('已添加平台额度')
+  }
+
+  const updateBudgetConfig = async (id: string, patch: Partial<InvestmentBudgetConfig>) => {
+    const next = budgetConfigs.map(item => item.id === id ? { ...item, ...patch } : item)
+    await saveBudgetConfigs(next)
+  }
+
+  const removeBudgetConfig = async (id: string) => {
+    await saveBudgetConfigs(budgetConfigs.filter(item => item.id !== id))
+    message.success('已删除平台额度')
+  }
 
   const fetchModels = async (target: 'ai' | 'ocr') => {
     const values = apiForm.getFieldsValue()
@@ -114,7 +178,7 @@ export default function Settings() {
     try {
       const [apiKey, baseUrl, model, pers, style, schedCfg,
         dsStockA, dsStockHK, dsStockUS, dsFundA, dsFundHK, dsFundUS, providersInfo,
-        ocrSame, ocrKey, ocrBase, ocrModel] = await Promise.all([
+        ocrSame, ocrKey, ocrBase, ocrModel, budgetCfg] = await Promise.all([
         settingsApi.get('openai_api_key'),
         settingsApi.get('openai_base_url'),
         settingsApi.get('openai_model'),
@@ -132,6 +196,7 @@ export default function Settings() {
         settingsApi.get('ocr_api_key'),
         settingsApi.get('ocr_base_url'),
         settingsApi.get('ocr_model'),
+        settingsApi.get('investment_budget_configs'),
       ])
       apiForm.setFieldsValue({
         openai_api_key: apiKey.value,
@@ -156,13 +221,22 @@ export default function Settings() {
         US: dsStockUS.value || 'yahoo',
       })
       setFundProviders({
-        A: dsFundA.value || 'eastmoney',
+        A: dsFundA.value || 'tiantian',
         HK: dsFundHK.value || 'eastmoney',
         US: dsFundUS.value || 'yahoo',
       })
       setProviderLabels(providersInfo.labels)
       setStockProviderOpts(providersInfo.stock_options)
       setFundProviderOpts(providersInfo.fund_options)
+      try {
+        setBudgetConfigs(normalizeBudgetConfigs(JSON.parse(budgetCfg.value || '[]')))
+        try {
+          const pcfg = await parallelApi.getConfig()
+          setParallelConfig(pcfg)
+        } catch { /* use defaults */ }
+      } catch {
+        setBudgetConfigs([])
+      }
     } catch (e) {
       console.error('Failed to load settings', e)
     }
@@ -180,8 +254,9 @@ export default function Settings() {
         settingsApi.update('ocr_api_key', values.ocr_api_key || ''),
         settingsApi.update('ocr_base_url', values.ocr_base_url || ''),
         settingsApi.update('ocr_model', values.ocr_model || 'gpt-4o-mini'),
+        parallelApi.saveConfig(parallelConfig),
       ])
-      message.success('API 配置保存成功')
+      message.success('所有配置已保存')
     } catch (e) {
       message.error('保存失败')
     } finally {
@@ -310,10 +385,105 @@ export default function Settings() {
                   }
                 />
               </Form.Item>
-          </Card>
+	            </Card>
 
-          <Card
-            title={
+	            <Card
+	              title={
+	                <Space>
+	                  <WalletOutlined style={goldStyle} />
+	                  <span>AI 投资建议额度</span>
+	                </Space>
+	              }
+	              extra={
+	                <Button size="small" icon={<PlusOutlined />} onClick={addBudgetConfig} style={{ borderRadius: 8 }}>
+	                  添加平台
+	                </Button>
+	              }
+	              style={{ marginBottom: 16 }}
+	            >
+	              <Space direction="vertical" style={{ width: '100%' }} size="middle">
+	                {budgetConfigs.length === 0 ? (
+	                  <div style={{
+	                    padding: 18,
+	                    borderRadius: 10,
+	                    border: '1px dashed rgba(201,168,76,0.28)',
+	                    background: 'rgba(201,168,76,0.04)',
+	                    color: '#9a9892',
+	                    fontSize: 13,
+	                  }}>
+	                    尚未配置平台投资额度
+	                  </div>
+	                ) : null}
+	                {budgetConfigs.map(config => (
+	                  <div key={config.id} style={{
+	                    padding: '14px 16px',
+	                    borderRadius: 10,
+	                    background: 'rgba(26, 26, 36, 0.5)',
+	                    border: '1px solid rgba(255,255,255,0.05)',
+	                  }}>
+	                    <Row gutter={[10, 10]} align="middle">
+	                      <Col xs={24} md={9}>
+	                        <Input
+	                          value={config.platform}
+	                          placeholder="平台名称"
+	                          onChange={e => updateBudgetConfig(config.id, { platform: e.target.value })}
+	                        />
+	                      </Col>
+	                      <Col xs={12} md={7}>
+	                        <InputNumber
+	                          min={0}
+	                          value={config.amount}
+	                          placeholder="额度"
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { amount: Number(v || 0) })}
+	                        />
+	                      </Col>
+	                      <Col xs={12} md={6}>
+	                        <Select
+	                          value={config.currency}
+	                          options={CURRENCY_OPTIONS}
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { currency: v })}
+	                        />
+	                      </Col>
+	                      <Col xs={24} md={2} style={{ textAlign: 'right' }}>
+	                        <Button
+	                          danger
+	                          type="text"
+	                          icon={<DeleteOutlined />}
+	                          onClick={() => removeBudgetConfig(config.id)}
+	                        />
+	                      </Col>
+	                      <Col xs={24} md={12}>
+	                        <Select
+	                          mode="multiple"
+	                          value={config.asset_types}
+	                          options={ASSET_TYPE_OPTIONS}
+	                          placeholder="投资类型"
+	                          maxTagCount={2}
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { asset_types: v })}
+	                        />
+	                      </Col>
+	                      <Col xs={24} md={12}>
+	                        <Select
+	                          mode="multiple"
+	                          value={config.markets}
+	                          options={MARKET_OPTIONS}
+	                          placeholder="股市类型"
+	                          maxTagCount={3}
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { markets: v })}
+	                        />
+	                      </Col>
+	                    </Row>
+	                  </div>
+	                ))}
+	              </Space>
+	            </Card>
+
+	            <Card
+	              title={
               <Space>
                 <FileTextOutlined style={goldStyle} />
                 <span>OCR 识别模型配置</span>
@@ -574,14 +744,14 @@ export default function Settings() {
                         }}>
                           <Text style={{ color: '#9a9892', minWidth: 50, fontSize: 13 }}>{marketLabel}</Text>
                           <Select
-                            value={fundProviders[market] || 'eastmoney'}
+                            value={fundProviders[market] || (market === 'A' ? 'tiantian' : 'eastmoney')}
                             onChange={async (v) => {
                               setFundProviders(prev => ({ ...prev, [market]: v }))
                               await settingsApi.update(`datasource_fund_${market}`, v)
                               message.success(`${marketLabel}基金数据源已更新`)
                             }}
                             style={{ flex: 1 }}
-                            options={(fundProviderOpts[market] || ['eastmoney', 'yahoo']).map(p => ({
+                            options={(fundProviderOpts[market] || (market === 'A' ? ['tiantian', 'eastmoney', 'tencent', 'sina'] : ['eastmoney', 'yahoo'])).map(p => ({
                               value: p, label: providerLabels[p] || p,
                             }))}
                           />
@@ -727,6 +897,206 @@ export default function Settings() {
                 </div>
               </Space>
             </Card>
+
+          <Card
+            title={
+              <Space>
+                <SettingOutlined />
+                <span>并行策略配置</span>
+              </Space>
+            }
+            style={{ marginBottom: 16 }}
+          >
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <div style={{
+                padding: '12px 16px', borderRadius: 10,
+                background: 'rgba(201, 168, 76, 0.06)',
+                border: '1px solid rgba(201, 168, 76, 0.12)',
+              }}>
+                <Space>
+                  <span style={{ fontSize: 16 }}>⚡</span>
+                  <Text style={{ color: '#c9a84c', fontSize: 13 }}>
+                    启用后，系统将利用多线程并行执行 AI 分析任务，显著提升处理速度。
+                    适合拥有大批量资产或标的的用户。根据您的 API 限流情况调整并行度。
+                  </Text>
+                </Space>
+              </div>
+
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '16px 20px', borderRadius: 12,
+                background: 'rgba(26, 26, 36, 0.5)',
+                border: '1px solid rgba(255,255,255,0.04)',
+              }}>
+                <Space direction="vertical" size={2}>
+                  <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>启用并行执行</Text>
+                  <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                    主开关，关闭后所有分析任务将串行执行
+                  </Text>
+                </Space>
+                <Switch
+                  checked={parallelConfig.enabled}
+                  onChange={async (checked) => {
+                    const next = { ...parallelConfig, enabled: checked }
+                    setParallelConfig(next)
+                    await parallelApi.saveConfig(next).catch(() => {})
+                  }}
+                />
+              </div>
+
+              <Row gutter={16}>
+                <Col span={12}>
+                  <div style={{
+                    padding: '16px 20px', borderRadius: 12,
+                    background: 'rgba(26, 26, 36, 0.5)',
+                    border: '1px solid rgba(255,255,255,0.04)',
+                  }}>
+                    <Text style={{ color: '#9a9892', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                      最大并行工作线程数
+                    </Text>
+                    <InputNumber
+                      min={1}
+                      max={10}
+                      value={parallelConfig.max_workers}
+                      onChange={async (v) => {
+                        const next = { ...parallelConfig, max_workers: Number(v || 3) }
+                        setParallelConfig(next)
+                        await parallelApi.saveConfig(next).catch(() => {})
+                      }}
+                      disabled={!parallelConfig.enabled}
+                      style={{ width: '100%' }}
+                    />
+                    <Text style={{ color: '#5c5a55', fontSize: 11, marginTop: 4, display: 'block' }}>
+                      建议 2-5。OpenAI 免费用户建议 2。
+                    </Text>
+                  </div>
+                </Col>
+                <Col span={12}>
+                  <div style={{
+                    padding: '16px 20px', borderRadius: 12,
+                    background: 'rgba(26, 26, 36, 0.5)',
+                    border: '1px solid rgba(255,255,255,0.04)',
+                  }}>
+                    <Text style={{ color: '#9a9892', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                      每批资产分析数量
+                    </Text>
+                    <InputNumber
+                      min={1}
+                      max={20}
+                      value={parallelConfig.batch_size}
+                      onChange={async (v) => {
+                        const next = { ...parallelConfig, batch_size: Number(v || 5) }
+                        setParallelConfig(next)
+                        await parallelApi.saveConfig(next).catch(() => {})
+                      }}
+                      disabled={!parallelConfig.enabled}
+                      style={{ width: '100%' }}
+                    />
+                    <Text style={{ color: '#5c5a55', fontSize: 11, marginTop: 4, display: 'block' }}>
+                      每批分析几项资产。增大可能提高费用。
+                    </Text>
+                  </div>
+                </Col>
+              </Row>
+
+              <Row gutter={16}>
+                <Col span={12}>
+                  <div style={{
+                    padding: '16px 20px', borderRadius: 12,
+                    background: 'rgba(26, 26, 36, 0.5)',
+                    border: '1px solid rgba(255,255,255,0.04)',
+                  }}>
+                    <Text style={{ color: '#9a9892', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                      单次 AI 调用超时（秒）
+                    </Text>
+                    <InputNumber
+                      min={30}
+                      max={300}
+                      value={parallelConfig.ai_timeout_seconds}
+                      onChange={async (v) => {
+                        const next = { ...parallelConfig, ai_timeout_seconds: Number(v || 120) }
+                        setParallelConfig(next)
+                        await parallelApi.saveConfig(next).catch(() => {})
+                      }}
+                      disabled={!parallelConfig.enabled}
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                </Col>
+                <Col span={12}>
+                  <div style={{
+                    padding: '16px 20px', borderRadius: 12,
+                    background: 'rgba(26, 26, 36, 0.5)',
+                    border: '1px solid rgba(255,255,255,0.04)',
+                  }}>
+                    <Text style={{ color: '#9a9892', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                      Agent 技能并行执行
+                    </Text>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                        将无依赖关系的 AI 技能并行执行
+                      </Text>
+                      <Switch
+                        size="small"
+                        checked={parallelConfig.parallel_skills}
+                        onChange={async (checked) => {
+                          const next = { ...parallelConfig, parallel_skills: checked }
+                          setParallelConfig(next)
+                          await parallelApi.saveConfig(next).catch(() => {})
+                        }}
+                        disabled={!parallelConfig.enabled}
+                      />
+                    </div>
+                  </div>
+                </Col>
+              </Row>
+
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '16px 20px', borderRadius: 12,
+                background: 'rgba(26, 26, 36, 0.5)',
+                border: '1px solid rgba(255,255,255,0.04)',
+              }}>
+                <Space direction="vertical" size={2}>
+                  <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>资产批量并行分析</Text>
+                  <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                    资产数量超过每批大小时，分批并行调用 AI 分析
+                  </Text>
+                </Space>
+                <Switch
+                  checked={parallelConfig.parallel_assets}
+                  onChange={async (checked) => {
+                    const next = { ...parallelConfig, parallel_assets: checked }
+                    setParallelConfig(next)
+                    await parallelApi.saveConfig(next).catch(() => {})
+                  }}
+                  disabled={!parallelConfig.enabled}
+                />
+              </div>
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '16px 20px', borderRadius: 12,
+                background: 'rgba(26, 26, 36, 0.5)',
+                border: '1px solid rgba(255,255,255,0.04)',
+              }}>
+                <Space direction="vertical" size={2}>
+                  <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>Dashboard 并行分析</Text>
+                  <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                    Dashboard 中"一键 AI 分析"同时执行资产分析、标的分析和投资建议
+                  </Text>
+                </Space>
+                <Switch
+                  checked={parallelConfig.parallel_dashboard_steps}
+                  onChange={async (checked) => {
+                    const next = { ...parallelConfig, parallel_dashboard_steps: checked }
+                    setParallelConfig(next)
+                    await parallelApi.saveConfig(next).catch(() => {})
+                  }}
+                  disabled={!parallelConfig.enabled}
+                />
+              </div>
+            </Space>
+          </Card>
 
           <Card
             title={

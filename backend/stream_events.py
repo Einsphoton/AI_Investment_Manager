@@ -47,8 +47,11 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=90)
+    from ai_service import openai_runtime_summary
+    runtime_summary = openai_runtime_summary(api_key, base_url, model)
 
     # Stage 1: Load assets (slow start)
+    yield sse_event("log", {"message": f"当前 AI 配置：{runtime_summary}", "tag": "配置"})
     yield sse_event("log", {"message": "正在加载资产数据...", "tag": "加载"})
     assets = db.query(Asset).all()
     yield sse_event("log", {"message": f"已加载 {len(assets)} 项持仓资产", "tag": "加载"})
@@ -193,7 +196,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
 
     except Exception as e:
         import traceback
-        yield sse_event("error", {"detail": f"AI 分析失败: {str(e)}"})
+        yield sse_event("error", {"detail": f"AI 分析失败: {str(e)}；当前使用配置：{runtime_summary}"})
         yield sse_event("log", {"message": f"❌ 分析出错: {str(e)}", "tag": "AI"})
 
 
@@ -348,7 +351,11 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
 
     yield sse_event("log", {"message": "正在读取持仓与额度配置...", "tag": "配置"})
 
-    from main import _load_investment_budgets, _investment_budget_status, _candidate_investment_targets, _read_providers, _latest_today_asset_analysis
+    from main import (
+        _load_investment_budgets, _investment_budget_status,
+        _candidate_investment_targets, _read_providers,
+        _latest_today_asset_analysis, _build_investment_advice_prompt,
+    )
     budgets = _load_investment_budgets(db)
     if not budgets:
         yield sse_event("error", {"detail": "请先在设置页面配置平台投资额度"})
@@ -375,40 +382,13 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
     yield sse_event("progress", {"progress": 25})
 
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=120)
-    prompt = f"""{system_prompt}
-
-请生成"AI 投资建议"交易清单。
-
-平台额度状态：
-{json.dumps(budget_status, ensure_ascii=False, default=str)}
-
-当前持仓及最新行情：
-{json.dumps(asset_items, ensure_ascii=False, default=str)[:8000]}
-
-我的标的池及最新行情：
-{json.dumps(target_items[:30], ensure_ascii=False, default=str)[:8000]}
-
-请返回 JSON：
-{{
-  "summary": "整体交易建议摘要",
-  "advice": [
-    {{
-      "platform": "平台",
-      "market": "A/HK/US",
-      "asset_type": "stock/onshore_fund/offshore_fund",
-      "code": "代码",
-      "name": "名称",
-      "trade_type": "BUY/SELL",
-      "shares": 0,
-      "price": 0,
-      "reason": "交易理由",
-      "confidence_score": 0,
-      "risk_note": "风险提示"
-    }}
-  ]
-}}"""
-
-    yield sse_event("log", {"message": "正在调用 AI 模型生成投资建议...", "tag": "AI"})
+    prompt, market_snapshot = _build_investment_advice_prompt(
+        system_prompt,
+        budget_status,
+        asset_items,
+        target_items,
+        today_analysis,
+    )
     yield sse_event("progress", {"progress": 30})
 
     try:
@@ -444,7 +424,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         raw = json.loads(collected_clean)
 
         from main import _normalize_investment_advice
-        result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status)
+        result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status, market_snapshot)
 
         # Save to DB
         from models import InvestmentAdviceRecord

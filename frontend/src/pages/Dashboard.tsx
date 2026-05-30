@@ -197,6 +197,7 @@ export default function Dashboard() {
       } else {
         // === SEQUENTIAL MODE with REAL SSE streaming ===
         aiCtx.addLog('正在连接 AI 分析引擎...', 'info')
+        let portfolioSucceeded = false
         try {
           const result = await aiCtx.streamSSE('/api/analysis/run-stream')
           if (result && result.summary) {
@@ -206,6 +207,7 @@ export default function Dashboard() {
             } catch {
               setAnalysis(result as any)
             }
+            portfolioSucceeded = true
           }
         } catch (e: any) {
           // User cancelled - skip fallback
@@ -215,11 +217,14 @@ export default function Dashboard() {
           try {
             const result = await analysisApi.run(false)
             setAnalysis(result)
+            portfolioSucceeded = true
           } catch (e2: any) {
             aiCtx.addLog('❌ AI 资产分析失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error')
           }
         }
-        aiCtx.addLog('✅ AI 资产分析完成', 'success')
+        if (portfolioSucceeded) {
+          aiCtx.addLog('✅ AI 资产分析完成', 'success')
+        }
 
         if (includeTargets) {
           try {

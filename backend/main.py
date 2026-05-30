@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, time as datetime_time, timedelta
@@ -34,7 +35,7 @@ from schemas import (
     MarketFundamentalsRequest, MarketFundamentalsResponse,
     OcrParseResponse, OcrAssetItem, AssetsBatchCreate,
 )
-from ai_service import run_ai_analysis, get_setting, set_setting
+from ai_service import run_ai_analysis, get_setting, set_setting, safe_key_fingerprint
 from data_source import lookup_name, get_quote, get_history, get_fundamentals, search, PROVIDER_LABELS, STOCK_PROVIDER_OPTIONS, FUND_PROVIDER_OPTIONS
 from ocr_service import parse_image
 from agent import AgentHarness
@@ -152,6 +153,10 @@ def _run_scheduled_target_analysis(db: Session):
         target_result["new_recommendations"] = new_recs
         existing_analysis = target_result.get("existing_targets_analysis") or []
 
+        # Track recommendation stats
+        _added_count = 0
+        _removed_count = 0
+
         # Process new recommendations FIRST so removal logic below takes final effect
         for rec in new_recs:
             if not isinstance(rec, dict) or not rec.get("code"):
@@ -172,6 +177,7 @@ def _run_scheduled_target_analysis(db: Session):
                 except Exception:
                     pass
             else:
+                _added_count += 1
                 rec_price = None
                 try:
                     q = get_quote(code.strip().upper(), str(rec.get("market") or "A"), str(rec.get("asset_type") or "stock"), providers)
@@ -210,6 +216,7 @@ def _run_scheduled_target_analysis(db: Session):
             ).first()
             if t:
                 if item.get("keep") is False:
+                    _removed_count += 1
                     db.delete(t)
                 else:
                     rec_price = price_map.get(t.code)
@@ -221,10 +228,38 @@ def _run_scheduled_target_analysis(db: Session):
                         t.ai_analysis = "{}"
                     t.last_analyzed_at = datetime.utcnow().isoformat()
 
+        _save_recommendation_snapshot(db, _added_count, _removed_count, "标的分析完成")
         db.commit()
     except Exception:
         import traceback
         traceback.print_exc()
+
+
+
+def _save_recommendation_snapshot(db, added_count, removed_count, summary=""):
+    """Save a recommendation stats snapshot after each AI recommendation cycle."""
+    from models import RecommendationSnapshot
+    db.flush()
+    total_after = db.query(Target).filter(
+        Target.status == "active",
+    ).count()
+    # Debug: log the actual state
+    all_targets = db.query(Target).filter(Target.status == "active").all()
+    print(f"[DEBUG] _save_recommendation_snapshot: added={added_count}, removed={removed_count}, total_after={total_after}")
+    print(f"[DEBUG] Active targets ({len(all_targets)}): {[t.code for t in all_targets]}")
+    maintained_count = max(0, total_after - added_count)
+    if total_after > 0 and added_count > 0 and added_count + maintained_count != total_after:
+        maintained_count = total_after - added_count
+    snapshot = RecommendationSnapshot(
+        added_count=added_count,
+        removed_count=removed_count,
+        maintained_count=max(0, maintained_count),
+        total_after=total_after,
+        summary=summary,
+    )
+    db.add(snapshot)
+    db.commit()
+    print(f"[DEBUG] Snapshot saved: added={added_count}, removed={removed_count}, maintained={max(0, maintained_count)}, total={total_after}")
 
 
 def _build_trigger(cfg: dict):
@@ -283,6 +318,27 @@ app.add_middleware(
 )
 
 
+def _is_failed_analysis_record(record: AnalysisRecord | None) -> bool:
+    if not record:
+        return False
+    summary = record.summary or ""
+    detail = record.detail or ""
+    failure_markers = (
+        "AI 分析失败",
+        "AI 分析暂不可用",
+        "FreeUsageLimitError",
+        "Rate limit exceeded",
+        "Error code: 429",
+    )
+    text = f"{summary}\n{detail}"
+    return any(marker in text for marker in failure_markers)
+
+
+def _latest_successful_analysis(db: Session) -> AnalysisRecord | None:
+    records = db.query(AnalysisRecord).order_by(AnalysisRecord.created_at.desc()).limit(20).all()
+    return next((record for record in records if not _is_failed_analysis_record(record)), None)
+
+
 @app.get("/api/dashboard", response_model=DashboardData)
 def get_dashboard(db: Session = Depends(get_db)):
     assets = db.query(Asset).all()
@@ -291,7 +347,7 @@ def get_dashboard(db: Session = Depends(get_db)):
     total_pnl = total_market_value - total_cost
     total_pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0
 
-    latest_analysis = db.query(AnalysisRecord).order_by(AnalysisRecord.created_at.desc()).first()
+    latest_analysis = _latest_successful_analysis(db)
     realized = latest_analysis.realized_pnl if latest_analysis else 0
 
     return DashboardData(
@@ -665,9 +721,11 @@ def _budget_matches_asset(budget: dict, asset_or_target: dict) -> bool:
 
 def _investment_budget_status(budgets: list[dict], assets: list[Asset]) -> list[dict]:
     status = []
+    # Only count AI-advice-purchased assets against the budget
+    advice_assets = [a for a in assets if getattr(a, 'source', 'manual') == 'ai_advice']
     for budget in budgets:
         used = 0.0
-        for asset in assets:
+        for asset in advice_assets:
             item = {"market": asset.market, "asset_type": asset.asset_type}
             if asset.platform == budget["platform"] and _budget_matches_asset(budget, item):
                 used += (asset.current_price if asset.current_price and asset.current_price > 0 else asset.buy_price) * (asset.shares or 0)
@@ -681,6 +739,262 @@ def _investment_budget_status(budgets: list[dict], assets: list[Asset]) -> list[
             "market_labels": [_market_label(v) for v in budget["markets"]],
         })
     return status
+
+
+def _quote_value(item: dict, key: str, default=None):
+    quote = item.get("quote") if isinstance(item.get("quote"), dict) else {}
+    value = quote.get(key)
+    if value is None:
+        value = item.get(key)
+    return default if value is None else value
+
+
+def _investment_market_snapshot(asset_items: list[dict], target_items: list[dict], budget_status: list[dict]) -> dict:
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    all_items = [*asset_items, *target_items]
+    markets = sorted({str(i.get("market") or "") for i in all_items if i.get("market")})
+    market_breadth = []
+
+    for market in markets:
+        changes = []
+        for item in all_items:
+            if item.get("market") != market:
+                continue
+            pct = _normalize_ai_number(_quote_value(item, "change_pct"), None)
+            if pct is not None:
+                changes.append(pct)
+        if not changes:
+            market_breadth.append({
+                "market": market,
+                "market_label": _market_label(market),
+                "samples": 0,
+                "assessment": "行情覆盖不足，不能据此判断强弱",
+            })
+            continue
+        up = len([v for v in changes if v > 0])
+        down = len([v for v in changes if v < 0])
+        flat = len(changes) - up - down
+        avg_change = round(sum(changes) / len(changes), 2)
+        if avg_change >= 0.6 and up >= down:
+            assessment = "偏强"
+        elif avg_change <= -0.6 and down > up:
+            assessment = "偏弱"
+        else:
+            assessment = "震荡"
+        market_breadth.append({
+            "market": market,
+            "market_label": _market_label(market),
+            "samples": len(changes),
+            "up_count": up,
+            "down_count": down,
+            "flat_count": flat,
+            "avg_change_pct": avg_change,
+            "assessment": assessment,
+        })
+
+    total_cost = 0.0
+    total_market_value = 0.0
+    positions = []
+    for item in asset_items:
+        shares = _normalize_ai_number(item.get("shares"), 0)
+        buy_price = _normalize_ai_number(item.get("buy_price"), 0)
+        current_price = _normalize_ai_number(_quote_value(item, "current_price"), buy_price)
+        cost = shares * buy_price
+        market_value = shares * current_price
+        pnl = market_value - cost
+        pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+        total_cost += cost
+        total_market_value += market_value
+        positions.append({
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "market_value": round(market_value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "change_pct": _quote_value(item, "change_pct"),
+        })
+
+    total_pnl = total_market_value - total_cost
+    portfolio = {
+        "total_cost": round(total_cost, 2),
+        "total_market_value": round(total_market_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round((total_pnl / total_cost * 100) if total_cost > 0 else 0, 2),
+        "position_count": len(asset_items),
+        "largest_losses": sorted(positions, key=lambda x: x["pnl_pct"])[:3],
+        "largest_gains": sorted(positions, key=lambda x: x["pnl_pct"], reverse=True)[:3],
+    }
+
+    remaining_total = sum(_normalize_ai_number(b.get("remaining_amount"), 0) for b in budget_status)
+    amount_total = sum(_normalize_ai_number(b.get("amount"), 0) for b in budget_status)
+    data_quality = {
+        "quote_items": len([i for i in all_items if _quote_value(i, "current_price") is not None]),
+        "total_items": len(all_items),
+        "target_count": len(target_items),
+        "holding_count": len(asset_items),
+    }
+
+    return {
+        "generated_at": generated_at,
+        "market_breadth": market_breadth,
+        "portfolio": portfolio,
+        "budget": {
+            "total_amount": round(amount_total, 2),
+            "remaining_amount": round(remaining_total, 2),
+            "remaining_pct": round((remaining_total / amount_total * 100) if amount_total > 0 else 0, 2),
+        },
+        "data_quality": data_quality,
+    }
+
+
+def _compact_investment_candidates(asset_items: list[dict], target_items: list[dict], today_analysis: dict) -> dict:
+    holdings = []
+    for item in asset_items:
+        shares = _normalize_ai_number(item.get("shares"), 0)
+        buy_price = _normalize_ai_number(item.get("buy_price"), 0)
+        current_price = _normalize_ai_number(_quote_value(item, "current_price"), buy_price)
+        cost = shares * buy_price
+        pnl_pct = ((current_price - buy_price) / buy_price * 100) if buy_price > 0 else 0
+        code_key = str(item.get("code") or "").strip().upper()
+        holdings.append({
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "asset_type": item.get("asset_type"),
+            "platform": item.get("platform"),
+            "shares": shares,
+            "buy_price": buy_price,
+            "current_price": current_price,
+            "intraday_change_pct": _quote_value(item, "change_pct"),
+            "position_pnl_pct": round(pnl_pct, 2),
+            "position_cost": round(cost, 2),
+            "latest_asset_analysis": today_analysis.get(code_key, {}),
+        })
+
+    targets = []
+    for item in target_items:
+        ai_analysis = item.get("ai_analysis") if isinstance(item.get("ai_analysis"), dict) else {}
+        targets.append({
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "asset_type": item.get("asset_type"),
+            "source": item.get("source"),
+            "priority": item.get("priority"),
+            "risk_level": item.get("risk_level"),
+            "reason": item.get("reason"),
+            "expected_return": item.get("expected_return"),
+            "current_price": _quote_value(item, "current_price"),
+            "intraday_change_pct": _quote_value(item, "change_pct"),
+            "previous_ai_summary": ai_analysis.get("summary") or ai_analysis.get("analysis") or ai_analysis,
+        })
+
+    return {"holdings": holdings, "targets": targets[:40]}
+
+
+def _build_investment_advice_prompt(
+    system_prompt: str,
+    budget_status: list[dict],
+    asset_items: list[dict],
+    target_items: list[dict],
+    today_analysis: dict,
+) -> tuple[str, dict]:
+    market_snapshot = _investment_market_snapshot(asset_items, target_items, budget_status)
+    candidate_digest = _compact_investment_candidates(asset_items, target_items, today_analysis)
+
+    prompt = f"""{system_prompt}
+
+请生成“AI 投资建议”交易清单。你必须先根据本次运行时的行情、持仓盈亏、额度状态和标的池证据做完整决策，再输出少量可执行建议；禁止为了凑数量而从持仓或标的池里随便挑选。
+
+## 本次运行市场环境快照
+{json.dumps(market_snapshot, ensure_ascii=False, default=str)}
+
+## 平台额度状态
+{json.dumps(budget_status, ensure_ascii=False, default=str)}
+
+## 决策候选清单
+{json.dumps(candidate_digest, ensure_ascii=False, default=str)[:16000]}
+
+## 原始持仓及最新行情
+{json.dumps(asset_items, ensure_ascii=False, default=str)[:12000]}
+
+## 原始标的池及最新行情
+{json.dumps(target_items[:40], ensure_ascii=False, default=str)[:12000]}
+
+## 今天的资产 AI 分析结果
+{json.dumps(today_analysis, ensure_ascii=False, default=str)[:12000]}
+
+## 强制决策流程
+1. 先判断市场环境：逐个市场说明样本涨跌、平均涨跌幅、数据覆盖是否足够。
+2. 再逐项审视持仓：必须结合持仓盈亏、当日涨跌、已有资产分析判断是否需要卖出或继续持有。
+3. 再逐项审视候选标的：必须结合入选理由、前期 AI 分析、当前价格/涨跌和额度约束判断是否值得买入。
+4. 最后只输出通过审视的交易建议；如果证据不足，advice 必须返回空数组，并在 summary 说明原因。
+
+## 硬性约束
+1. 买入建议只能来自当前持仓或标的池，卖出建议只能来自当前持仓。
+2. 买入建议必须符合对应平台的 currency、asset_types、markets 配置，且总金额不能超过 remaining_amount。
+3. 禁止要求把某个平台剩余额度一次性全部花完；除非市场和个体证据都很强，否则单个平台建议使用 10%-40% 剩余额度。
+4. 不要为了“有建议”而建议；宁可输出空建议，也不能输出缺少市场环境、价格、盈亏、估值/前期分析依据的建议。
+5. shares 必须是数字；price 使用最新行情价；trade_type 只能是 BUY 或 SELL。
+6. 每条 advice 的 reason 必须引用至少两个具体数据点，例如当前价、当日涨跌幅、持仓盈亏、额度占用、PE/PB、前期分析结论等。
+7. 每条 advice 必须提供 evidence 数组，逐条列出支撑该交易的事实；没有 evidence 的建议会被系统丢弃。
+
+请只返回 JSON：
+{{
+  "summary": "整体交易建议摘要，必须包含市场环境判断、为何建议或不建议交易，200-500字",
+  "market_context": {{
+    "regime": "偏强/震荡/偏弱/数据不足",
+    "observations": ["观察1", "观察2", "观察3"]
+  }},
+  "decision_audit": [
+    {{
+      "code": "代码",
+      "decision": "BUY/SELL/HOLD/SKIP",
+      "key_facts": ["事实1", "事实2"],
+      "why": "为何通过或未通过"
+    }}
+  ],
+  "advice": [
+    {{
+      "budget_id": "平台额度 id",
+      "platform": "平台名称",
+      "market": "A/HK/US",
+      "asset_type": "stock/onshore_fund/offshore_fund",
+      "code": "交易代码",
+      "name": "交易对象名称",
+      "trade_type": "BUY/SELL",
+      "shares": 0,
+      "price": 0,
+      "reason": "详细交易理由，必须包含具体数据引用",
+      "evidence": ["具体证据1", "具体证据2"],
+      "confidence_score": 0,
+      "risk_note": "主要风险"
+    }}
+  ]
+}}"""
+    return prompt, market_snapshot
+
+
+def _has_numeric_evidence(text: str) -> bool:
+    return bool(re.search(r"\d+(?:\.\d+)?\s*(?:%|元|港元|美元|CNY|HKD|USD|倍|万|亿|PE|PB)?", text or "", re.I))
+
+
+def _advice_passes_evidence_gate(item: dict, existing_asset: Asset | None, candidate: dict, market_snapshot: dict) -> tuple[bool, str]:
+    evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+    reason = str(item.get("reason") or item.get("suggested_action") or "").strip()
+    combined = " ".join([reason, *[str(v) for v in evidence]])
+    if len(reason) < 24:
+        return False, "交易理由过短，无法证明经过完整分析"
+    if len(evidence) < 2:
+        return False, "缺少至少两条 evidence 证据"
+    if not _has_numeric_evidence(combined):
+        return False, "理由或证据未引用具体数据"
+    if not (existing_asset or candidate):
+        return False, "建议对象不在当前持仓或标的池中"
+    if market_snapshot.get("data_quality", {}).get("quote_items", 0) == 0:
+        return False, "本次运行缺少有效行情数据"
+    return True, ""
 
 
 def _latest_today_asset_analysis(db: Session, assets: list[Asset]) -> dict:
@@ -804,12 +1118,20 @@ def _find_budget(status: list[dict], budget_id: str | None, platform: str, marke
     return None
 
 
-def _normalize_investment_advice(raw: dict, budgets: list[dict], assets: list[Asset], targets: list[dict], budget_status: list[dict]) -> dict:
+def _normalize_investment_advice(
+    raw: dict,
+    budgets: list[dict],
+    assets: list[Asset],
+    targets: list[dict],
+    budget_status: list[dict],
+    market_snapshot: dict | None = None,
+) -> dict:
     if not isinstance(raw, dict):
         raw = {}
     raw_items = raw.get("advice") or raw.get("recommendations") or []
     if not isinstance(raw_items, list):
         raw_items = []
+    market_snapshot = market_snapshot or raw.get("market_snapshot") or {}
 
     assets_by_key = {
         (_analysis_code_key(a.code), a.market, a.asset_type): a
@@ -839,6 +1161,10 @@ def _normalize_investment_advice(raw: dict, budgets: list[dict], assets: list[As
         key = (code, market, asset_type)
         existing_asset = assets_by_key.get(key)
         candidate = targets_by_key.get(key) or {}
+        passes_gate, gate_reason = _advice_passes_evidence_gate(item, existing_asset, candidate, market_snapshot)
+        if not passes_gate:
+            print(f"[InvestmentAdvice:drop] {code or '<empty>'}: {gate_reason}")
+            continue
         name = item.get("name") or item.get("asset_name") or (existing_asset.name if existing_asset else candidate.get("name")) or code
         platform = str(item.get("platform") or "").strip()
         budget = _find_budget(budget_status, item.get("budget_id"), platform, market, asset_type)
@@ -891,6 +1217,7 @@ def _normalize_investment_advice(raw: dict, budgets: list[dict], assets: list[As
             "price": round(price, 4),
             "estimated_amount": round(estimated, 2),
             "reason": str(item.get("reason") or item.get("suggested_action") or "AI 建议").strip(),
+            "evidence": [str(v).strip() for v in item.get("evidence", []) if str(v).strip()] if isinstance(item.get("evidence"), list) else [],
             "confidence_score": int(_normalize_ai_number(item.get("confidence_score"), 50)),
             "risk_note": str(item.get("risk_note") or item.get("risk_warning") or "").strip(),
             "source": "holding" if existing_asset else "target",
@@ -898,38 +1225,25 @@ def _normalize_investment_advice(raw: dict, budgets: list[dict], assets: list[As
         })
 
     summary = raw.get("summary") or ("已生成投资建议" if normalized else "暂无符合额度和行情约束的投资建议")
-    return {"summary": summary, "advice": normalized, "budget_status": budget_status}
+    market_context = raw.get("market_context") if isinstance(raw.get("market_context"), dict) else {}
+    decision_audit = raw.get("decision_audit") if isinstance(raw.get("decision_audit"), list) else []
+    return {
+        "summary": summary,
+        "advice": normalized,
+        "budget_status": budget_status,
+        "market_context": market_context,
+        "market_snapshot": market_snapshot,
+        "decision_audit": decision_audit,
+    }
 
 
 def _fallback_investment_advice(budget_status: list[dict], targets: list[dict]) -> dict:
-    advice = []
-    for budget in budget_status:
-        if budget.get("remaining_amount", 0) <= 0:
-            continue
-        target = next((t for t in targets if _budget_matches_asset(budget, t) and _normalize_ai_number((t.get("quote") or {}).get("current_price"), 0) > 0), None)
-        if not target:
-            continue
-        price = _normalize_ai_number((target.get("quote") or {}).get("current_price"), 0)
-        amount = budget["remaining_amount"] * 0.25
-        shares = amount / price if price else 0
-        if shares <= 0:
-            continue
-        advice.append({
-            "budget_id": budget["id"],
-            "platform": budget["platform"],
-            "currency": budget["currency"],
-            "market": target["market"],
-            "asset_type": target["asset_type"],
-            "code": target["code"],
-            "name": target["name"],
-            "trade_type": "BUY",
-            "shares": shares,
-            "price": price,
-            "reason": "AI 服务暂不可用，基于标的池与剩余额度给出小比例试探性配置。",
-            "confidence_score": 30,
-        })
-        break
-    return {"summary": "AI 服务暂不可用，已生成保守的备用建议。", "advice": advice}
+    return {
+        "summary": "AI 服务暂不可用，未生成交易建议，避免在缺少完整推理时从标的池中机械挑选。",
+        "market_context": {"regime": "数据不足", "observations": ["AI 调用失败，未完成市场环境与候选标的审视"]},
+        "decision_audit": [],
+        "advice": [],
+    }
 
 
 @app.get("/api/assets/{asset_id}/detail", response_model=AssetDetailResponse)
@@ -937,18 +1251,6 @@ def get_asset_detail(asset_id: int, db: Session = Depends(get_db)):
     asset = db.query(Asset).filter(Asset.id == asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="资产不存在")
-
-    providers = _read_providers(db)
-    history = []
-    fundamentals = {}
-    try:
-        history = get_history(asset.code.strip().upper(), asset.market, asset.asset_type, providers) or []
-    except Exception as e:
-        print(f"[AssetDetail:history] {asset.code}: {e}")
-    try:
-        fundamentals = get_fundamentals(asset.code.strip().upper(), asset.market, asset.asset_type, providers) or {}
-    except Exception as e:
-        print(f"[AssetDetail:fundamentals] {asset.code}: {e}")
 
     transactions = (
         db.query(AssetTransaction)
@@ -961,8 +1263,8 @@ def get_asset_detail(asset_id: int, db: Session = Depends(get_db)):
 
     return AssetDetailResponse(
         asset=asset,
-        history=history,
-        fundamentals=fundamentals,
+        history=[],
+        fundamentals={},
         transactions=transactions,
         latest_analysis=latest_analysis,
     )
@@ -1202,7 +1504,7 @@ def stream_analysis_mock():
 
 @app.get("/api/analysis/latest", response_model=AnalysisResponse)
 def get_latest_analysis(db: Session = Depends(get_db)):
-    record = db.query(AnalysisRecord).order_by(AnalysisRecord.created_at.desc()).first()
+    record = _latest_successful_analysis(db)
     if not record:
         raise HTTPException(status_code=404, detail="暂无分析记录")
     return record
@@ -1268,6 +1570,25 @@ def check_models(body: CheckModelsBody, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"获取模型列表失败: {str(e)}")
 
 
+@app.get("/api/runtime/ai-config")
+def get_ai_runtime_config(db: Session = Depends(get_db)):
+    ai_key = get_setting(db, "openai_api_key")
+    ocr_key = get_setting(db, "ocr_api_key")
+    return {
+        "analysis": {
+            "api_key": safe_key_fingerprint(ai_key),
+            "base_url": get_setting(db, "openai_base_url") or "https://api.openai.com/v1",
+            "model": get_setting(db, "openai_model") or "gpt-4o-mini",
+        },
+        "ocr": {
+            "use_same_as_analysis": get_setting(db, "ocr_use_same_as_ai") != "false",
+            "api_key": safe_key_fingerprint(ocr_key),
+            "base_url": get_setting(db, "ocr_base_url") or "https://api.openai.com/v1",
+            "model": get_setting(db, "ocr_model") or "gpt-4o-mini",
+        },
+    }
+
+
 @app.get("/api/scheduler/config")
 def get_scheduler_config(db: Session = Depends(get_db)):
     return _get_scheduler_config(db)
@@ -1299,7 +1620,7 @@ def market_lookup(req: MarketLookupRequest, db: Session = Depends(get_db)):
 @app.post("/api/market/quote", response_model=MarketQuoteResponse)
 def market_quote(req: MarketQuoteRequest, db: Session = Depends(get_db)):
     providers = _read_providers(db)
-    result = get_quote(req.code.strip().upper(), req.market, req.asset_type, providers)
+    result = get_quote(req.code.strip().upper(), req.market, req.asset_type, providers, req.force_refresh)
     if not result:
         raise HTTPException(status_code=404, detail="无法获取行情数据")
     return MarketQuoteResponse(
@@ -1324,7 +1645,15 @@ def market_search(req: MarketSearchRequest, db: Session = Depends(get_db)):
 @app.post("/api/market/history", response_model=MarketHistoryResponse)
 def market_history(req: MarketHistoryRequest, db: Session = Depends(get_db)):
     providers = _read_providers(db)
-    history = get_history(req.code.strip().upper(), req.market, req.asset_type, providers)
+    history = get_history(
+        req.code.strip().upper(),
+        req.market,
+        req.asset_type,
+        providers,
+        req.period,
+        req.interval,
+        req.force_refresh,
+    )
     return MarketHistoryResponse(
         code=req.code,
         market=req.market,
@@ -1335,7 +1664,7 @@ def market_history(req: MarketHistoryRequest, db: Session = Depends(get_db)):
 @app.post("/api/market/fundamentals", response_model=MarketFundamentalsResponse)
 def market_fundamentals(req: MarketFundamentalsRequest, db: Session = Depends(get_db)):
     providers = _read_providers(db)
-    fundamentals = get_fundamentals(req.code.strip().upper(), req.market, req.asset_type, providers)
+    fundamentals = get_fundamentals(req.code.strip().upper(), req.market, req.asset_type, providers, req.force_refresh)
     return MarketFundamentalsResponse(
         code=req.code,
         market=req.market,
@@ -1519,11 +1848,39 @@ def delete_target(target_id: int, db: Session = Depends(get_db)):
 def clear_all_targets(db: Session = Depends(get_db)):
     try:
         db.query(Target).delete()
+        from models import RecommendationSnapshot
+        db.query(RecommendationSnapshot).delete()
         db.commit()
         return {"message": "所有标的已清空"}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"清空标的失败: {str(e)}")
+
+
+@app.get("/api/targets/debug-all")
+def debug_all_targets(db: Session = Depends(get_db)):
+    """Debug: return all targets in DB for troubleshooting."""
+    all_targets = db.query(Target).all()
+    return {
+        "total_count": len(all_targets),
+        "targets": [
+            {"id": t.id, "code": t.code, "name": t.name, "market": t.market,
+             "asset_type": t.asset_type, "source": t.source, "priority": t.priority,
+             "status": t.status, "created_at": str(t.created_at)}
+            for t in all_targets
+        ]
+    }
+
+
+@app.get("/api/targets/recommendation-stats")
+def get_recommendation_stats(db: Session = Depends(get_db)):
+    """Get the latest AI recommendation snapshot stats."""
+    from models import RecommendationSnapshot
+    snapshot = db.query(RecommendationSnapshot).order_by(RecommendationSnapshot.created_at.desc()).first()
+    if not snapshot:
+        return {"id": 0, "added_count": 0, "removed_count": 0, "maintained_count": 0, "total_after": 0, "summary": "暂无推荐记录", "created_at": None}
+    from schemas import RecommendationStatsResponse
+    return RecommendationStatsResponse.model_validate(snapshot)
 
 
 @app.post("/api/targets/ai-analyze-stream")
@@ -1681,6 +2038,10 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
             if market_data:
                 payload["market_data"] = market_data
 
+        # Track recommendation stats
+        _added_count = 0
+        _removed_count = 0
+
         # Filter new recommendations by AI recommend config
         filtered_recs = []
         for rec in (target_result.get("new_recommendations") or []):
@@ -1718,6 +2079,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                 except Exception:
                     pass
             else:
+                _added_count += 1
                 db.add(Target(
                     code=code,
                     name=safe_str(rec.get("name")) or code,
@@ -1742,6 +2104,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
             ).first()
             if t:
                 if item.get("keep") is False:
+                    _removed_count += 1
                     db.delete(t)
                 else:
                     rec_price = price_map.get(t.code)
@@ -1756,6 +2119,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                         t.ai_analysis = "{}"
                     t.last_analyzed_at = datetime.utcnow().isoformat()
 
+        _save_recommendation_snapshot(db, _added_count, _removed_count, market_insight or "标的分析完成")
         db.commit()
 
         return AgentAnalysisResponse(
@@ -1929,50 +2293,13 @@ def run_investment_advice(db: Session = Depends(get_db)):
     )
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=90)
 
-    prompt = f"""{ctx.system_prompt}
-
-请生成“AI 投资建议”交易清单。你需要结合投资性格、平台剩余额度、我的标的、我的持仓、今天已经生成过的资产 AI 分析结果，以及最新行情，给出可执行但克制的交易建议。
-
-平台额度状态：
-{json.dumps(budget_status, ensure_ascii=False, default=str)}
-
-当前持仓及最新行情：
-{json.dumps(asset_items, ensure_ascii=False, default=str)[:12000]}
-
-我的标的池及最新行情：
-{json.dumps(target_items[:40], ensure_ascii=False, default=str)[:12000]}
-
-今天的资产 AI 分析结果（如果为空，表示今天还没有跑过资产 AI 分析）：
-{json.dumps(today_analysis, ensure_ascii=False, default=str)[:12000]}
-
-约束：
-1. 买入建议必须来自当前持仓或我的标的池，卖出建议必须来自当前持仓。
-2. 买入建议必须符合对应平台的 currency、asset_types、markets 配置，且总金额不能超过 remaining_amount。
-3. 不要建议把某个平台剩余额度一次性全部花完；除非行情信号非常明确，否则单个平台建议使用 20%-60% 剩余额度。
-4. 不要过于保守；若有可用额度且标的池中存在较清晰机会，应给出至少一条小到中等仓位的买入建议。
-5. 如果行情/分析信号不足，可以给出少量卖出、减风险或不超过 25% 剩余额度的试探性买入建议。
-6. shares 必须是数字；price 使用最新行情价；trade_type 只能是 BUY 或 SELL。
-
-请只返回 JSON：
-{{
-  "summary": "整体交易建议摘要，120字以内",
-  "advice": [
-    {{
-      "budget_id": "平台额度 id",
-      "platform": "平台名称",
-      "market": "A/HK/US",
-      "asset_type": "stock/onshore_fund/offshore_fund",
-      "code": "交易代码",
-      "name": "交易对象名称",
-      "trade_type": "BUY/SELL",
-      "shares": 0,
-      "price": 0,
-      "reason": "交易理由，说明依据了性格、额度、标的/资产分析和行情",
-      "confidence_score": 0,
-      "risk_note": "主要风险"
-    }}
-  ]
-}}"""
+    prompt, market_snapshot = _build_investment_advice_prompt(
+        ctx.system_prompt,
+        budget_status,
+        asset_items,
+        target_items,
+        today_analysis,
+    )
 
     try:
         resp = client.chat.completions.create(
@@ -1988,7 +2315,7 @@ def run_investment_advice(db: Session = Depends(get_db)):
         print(f"[InvestmentAdvice] AI failed: {e}")
         raw = _fallback_investment_advice(budget_status, target_items)
 
-    result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status)
+    result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status, market_snapshot)
     # 持久化投资建议到数据库
     from models import InvestmentAdviceRecord
     record = InvestmentAdviceRecord(
@@ -2001,6 +2328,14 @@ def run_investment_advice(db: Session = Depends(get_db)):
     return InvestmentAdviceResponse(**result)
 
 
+@app.get('/api/investment-advice/budget-status')
+def get_budget_status(db: Session = Depends(get_db)):
+    """Return real-time budget status for each platform."""
+    budgets = _load_investment_budgets(db)
+    assets = db.query(Asset).all()
+    return _investment_budget_status(budgets, assets)
+
+
 @app.get('/api/investment-advice/latest')
 def get_latest_investment_advice(db: Session = Depends(get_db)):
     from models import InvestmentAdviceRecord
@@ -2011,6 +2346,9 @@ def get_latest_investment_advice(db: Session = Depends(get_db)):
         'summary': record.summary or '',
         'advice': json.loads(record.advice_json or '[]'),
         'budget_status': json.loads(record.budget_status_json or '[]'),
+        'market_context': {},
+        'market_snapshot': {},
+        'decision_audit': [],
     }
 
 
@@ -2086,6 +2424,7 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
                 current_price=price,
                 price_updated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
                 note="由 AI 投资建议采纳创建",
+                source="ai_advice",
             )
             db.add(asset)
             db.flush()
@@ -2152,6 +2491,19 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
     }
 
 
+@app.post("/api/investment-advice/reset-budget")
+def reset_investment_budget(db: Session = Depends(get_db)):
+    """Reset used investment budget by marking all AI-advice assets as manual."""
+    count = db.query(Asset).filter(Asset.source == "ai_advice").update(
+        {"source": "manual"}, synchronize_session=False
+    )
+    db.commit()
+    return {
+        "message": f"已重置投资额度，共 {count} 项 AI 建议资产不再占用预算",
+        "reset_count": count,
+    }
+
+
 @app.get("/api/skills/market")
 def list_marketplace_skills():
     return get_all_skills()
@@ -2193,7 +2545,14 @@ if os.path.isdir(STATIC_DIR):
     async def serve_root():
         index_path = os.path.join(STATIC_DIR, "index.html")
         if os.path.isfile(index_path):
-            return FileResponse(index_path)
+            from fastapi.responses import Response
+            with open(index_path, "rb") as f:
+                content_bytes = f.read()
+            return Response(
+                content=content_bytes,
+                media_type="text/html",
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+            )
         return {"detail": "Not Found"}
 
     @app.get("/{full_path:path}")
@@ -2202,7 +2561,14 @@ if os.path.isdir(STATIC_DIR):
             return {"detail": "Not Found"}
         index_path = os.path.join(STATIC_DIR, "index.html")
         if os.path.isfile(index_path):
-            return FileResponse(index_path)
+            from fastapi.responses import Response
+            with open(index_path, "rb") as f:
+                content_bytes = f.read()
+            return Response(
+                content=content_bytes,
+                media_type="text/html",
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
+            )
         return {"detail": "Not Found"}
 
 

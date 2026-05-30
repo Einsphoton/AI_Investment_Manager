@@ -26,6 +26,7 @@ def _migrate():
     inspector = inspect(engine)
     for table, col_defs in [
         ("analysis_records", [("asset_id", "INTEGER REFERENCES assets(id)")]),
+        ("assets", [("source", "VARCHAR(20) DEFAULT 'manual'")]),
     ]:
         existing = {c["name"] for c in inspector.get_columns(table)}
         for col_name, col_type in col_defs:

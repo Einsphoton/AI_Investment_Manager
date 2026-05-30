@@ -4,6 +4,52 @@ const api = axios.create({
   baseURL: '/api',
 })
 
+const CACHE_MISS = Symbol('cache-miss')
+const responseCache = new Map<string, { expires: number; value: any }>()
+const requestCache = new Map<string, Promise<any>>()
+
+const CACHE_VERSION = 'market-cache-v2'
+const cacheKey = (name: string, payload: any) => `${CACHE_VERSION}:${name}:${JSON.stringify(payload)}`
+
+const cloneValue = <T,>(value: T): T => {
+  if (Array.isArray(value)) return value.map(item => ({ ...item })) as T
+  if (value && typeof value === 'object') return { ...(value as any) }
+  return value
+}
+
+const getCached = <T,>(key: string): T | typeof CACHE_MISS => {
+  const item = responseCache.get(key)
+  if (!item) return CACHE_MISS
+  if (Date.now() > item.expires) {
+    responseCache.delete(key)
+    return CACHE_MISS
+  }
+  return cloneValue(item.value)
+}
+
+const setCached = <T,>(key: string, value: T, ttlMs: number): T => {
+  responseCache.set(key, { expires: Date.now() + ttlMs, value: cloneValue(value) })
+  if (responseCache.size > 600) {
+    Array.from(responseCache.keys()).slice(0, 100).forEach(k => responseCache.delete(k))
+  }
+  return cloneValue(value)
+}
+
+const postCached = <T,>(url: string, payload: any, ttlMs: number): Promise<T> => {
+  const key = cacheKey(url, payload)
+  const cached = getCached<T>(key)
+  if (cached !== CACHE_MISS) return Promise.resolve(cached)
+
+  const pending = requestCache.get(key)
+  if (pending) return pending.then(cloneValue)
+
+  const request = api.post<T>(url, payload)
+    .then(r => setCached(key, r.data, ttlMs))
+    .finally(() => requestCache.delete(key))
+  requestCache.set(key, request)
+  return request.then(cloneValue)
+}
+
 export interface Asset {
   id: number
   asset_type: string
@@ -17,6 +63,7 @@ export interface Asset {
   current_price: number | null
   price_updated_at: string
   note: string
+  source: string
   created_at: string
   updated_at: string
 }
@@ -126,6 +173,7 @@ export interface InvestmentAdviceItem {
   price: number
   estimated_amount: number
   reason: string
+  evidence?: string[]
   confidence_score: number
   risk_note: string
   source: string
@@ -136,6 +184,17 @@ export interface InvestmentAdviceResponse {
   summary: string
   advice: InvestmentAdviceItem[]
   budget_status: any[]
+  market_context?: {
+    regime?: string
+    observations?: string[]
+  }
+  market_snapshot?: any
+  decision_audit?: Array<{
+    code?: string
+    decision?: string
+    key_facts?: string[]
+    why?: string
+  }>
 }
 
 export const dashboardApi = {
@@ -175,6 +234,10 @@ export const investmentAdviceApi = {
   accept: (advice: InvestmentAdviceItem) =>
     api.post('/investment-advice/accept', { advice }).then(r => r.data),
   check: () => api.get<{configured: boolean; budget_count: number}>('/investment-advice/check').then(r => r.data),
+  resetBudget: () =>
+    api.post<{message: string; reset_count: number}>('/investment-advice/reset-budget').then(r => r.data),
+  budgetStatus: () =>
+    api.get<any[]>('/investment-advice/budget-status').then(r => r.data),
 }
 
 export const settingsApi = {
@@ -222,6 +285,16 @@ export const backupApi = {
   }),
 }
 
+export interface RecommendationStats {
+  id: number
+  added_count: number
+  removed_count: number
+  maintained_count: number
+  total_after: number
+  summary: string
+  created_at: string | null
+}
+
 export const targetsApi = {
   list: (params?: { source?: string; status?: string }) =>
     api.get<Target[]>('/targets', { params }).then(r => r.data),
@@ -235,6 +308,8 @@ export const targetsApi = {
     api.post<AgentAnalysisResponse>('/targets/ai-analyze', params || {}).then(r => r.data),
   clearAll: () =>
     api.post<{ message: string }>('/targets/clear-all').then(r => r.data),
+  recommendationStats: () =>
+    api.get<RecommendationStats>('/targets/recommendation-stats').then(r => r.data),
 }
 
 export interface MarketplaceSkill {
@@ -288,6 +363,74 @@ export interface MarketHistoryItem {
   high?: number
   low?: number
 }
+
+const historyPeriodDays: Record<string, number> = {
+  '1d': 1,
+  '5d': 5,
+  '1m': 31,
+  '3m': 93,
+  '6m': 186,
+  '1y': 366,
+  '2y': 366 * 2,
+  '3y': 366 * 3,
+  '5y': 366 * 5,
+  '10y': 366 * 10,
+}
+
+export const filterMarketHistory = (history: MarketHistoryItem[], period = '6m') => {
+  const sorted = [...history].filter(item => item.date && item.price > 0).sort((a, b) => a.date.localeCompare(b.date))
+  const days = historyPeriodDays[period]
+  if (!days || sorted.length === 0) return sorted
+  const latest = new Date(sorted[sorted.length - 1].date.slice(0, 10)).getTime()
+  const cutoff = latest - days * 24 * 60 * 60 * 1000
+  const filtered = sorted.filter(item => new Date(item.date.slice(0, 10)).getTime() >= cutoff)
+  return filtered.length > 0 ? filtered : sorted.slice(-days)
+}
+
+const bucketKey = (date: string, interval: string) => {
+  const d = new Date(date.slice(0, 10))
+  if (interval === 'month') return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  if (interval === 'quarter') return `${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3) + 1}`
+  if (interval === 'year') return String(d.getFullYear())
+  if (interval === 'week') {
+    const target = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+    const day = target.getUTCDay() || 7
+    target.setUTCDate(target.getUTCDate() + 4 - day)
+    const yearStart = new Date(Date.UTC(target.getUTCFullYear(), 0, 1))
+    const week = Math.ceil((((target.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+    return `${target.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+  }
+  return date.slice(0, 10)
+}
+
+export const aggregateMarketHistory = (history: MarketHistoryItem[], interval = 'day') => {
+  const sorted = [...history].filter(item => item.date && item.price > 0).sort((a, b) => a.date.localeCompare(b.date))
+  if (!['week', 'month', 'quarter', 'year'].includes(interval)) return sorted
+  const buckets: MarketHistoryItem[] = []
+  let currentKey = ''
+  let current: MarketHistoryItem | null = null
+  sorted.forEach(item => {
+    const key = bucketKey(item.date, interval)
+    const open = item.open ?? item.price
+    const high = item.high ?? item.price
+    const low = item.low ?? item.price
+    if (key !== currentKey) {
+      if (current) buckets.push(current)
+      currentKey = key
+      current = { date: item.date.slice(0, 10), price: item.price, open, high, low }
+    } else if (current) {
+      current.date = item.date.slice(0, 10)
+      current.price = item.price
+      current.high = Math.max(current.high ?? high, high)
+      current.low = Math.min(current.low ?? low, low)
+    }
+  })
+  if (current) buckets.push(current)
+  return buckets
+}
+
+export const transformMarketHistory = (history: MarketHistoryItem[], period = '6m', interval = 'day') =>
+  aggregateMarketHistory(filterMarketHistory(history, period), interval)
 
 export interface FundDividendRecord {
   date: string
@@ -350,17 +493,65 @@ export interface MarketProviders {
 
 export const marketApi = {
   lookup: (code: string, market: string, asset_type: string) =>
-    api.post<MarketLookupResult>('/market/lookup', { code, market, asset_type }).then(r => r.data),
-  quote: (code: string, market: string, asset_type: string) =>
-    api.post<MarketQuoteResult>('/market/quote', { code, market, asset_type }).then(r => r.data),
+    postCached<MarketLookupResult>('/market/lookup', { code, market, asset_type }, 10 * 60 * 1000),
+  quote: (code: string, market: string, asset_type: string, options?: { force_refresh?: boolean }) => {
+    const normalPayload = { code, market, asset_type }
+    if (options?.force_refresh) {
+      return api.post<MarketQuoteResult>('/market/quote', { ...normalPayload, force_refresh: true }).then(r => {
+        setCached(cacheKey('/market/quote', normalPayload), r.data, 90 * 1000)
+        return r.data
+      })
+    }
+    return postCached<MarketQuoteResult>('/market/quote', normalPayload, 90 * 1000)
+  },
   search: (keyword: string, market: string, asset_type: string) =>
     api.post<{ results: MarketSearchItem[] }>('/market/search', { keyword, market, asset_type }).then(r => r.data),
   providers: () =>
     api.get<MarketProviders>('/market/providers').then(r => r.data),
-  history: (code: string, market: string, asset_type: string) =>
-    api.post<{ code: string; market: string; history: MarketHistoryItem[] }>('/market/history', { code, market, asset_type }).then(r => r.data),
-  fundamentals: (code: string, market: string, asset_type: string) =>
-    api.post<MarketFundamentalsResponse>('/market/fundamentals', { code, market, asset_type }).then(r => r.data),
+  history: (code: string, market: string, asset_type: string, params?: { period?: string; interval?: string; force_refresh?: boolean }) => {
+    const { force_refresh, ...rest } = params || {}
+    const normalPayload = { code, market, asset_type, ...rest }
+    if (force_refresh) {
+      return api.post<{ code: string; market: string; history: MarketHistoryItem[] }>('/market/history', { ...normalPayload, force_refresh: true }).then(r => {
+        setCached(cacheKey('/market/history', normalPayload), r.data, 20 * 60 * 1000)
+        return r.data
+      })
+    }
+    return postCached<{ code: string; market: string; history: MarketHistoryItem[] }>('/market/history', normalPayload, 20 * 60 * 1000)
+  },
+  historyFullRange: async (code: string, market: string, asset_type: string, params?: { period?: string; interval?: string }) => {
+    const period = params?.period || '6m'
+    const interval = params?.interval || 'day'
+    if (interval === 'intraday') {
+      return marketApi.history(code, market, asset_type, { period, interval })
+    }
+    const data = await marketApi.historyFullRaw(code, market, asset_type)
+    return { ...data, history: transformMarketHistory(data.history || [], period, interval) }
+  },
+  historyFullRaw: async (code: string, market: string, asset_type: string) => {
+    const periods = ['10y', '5y', '3y', '1y', '6m']
+    let last: { code: string; market: string; history: MarketHistoryItem[] } | null = null
+    for (const period of periods) {
+      const data = await postCached<{ code: string; market: string; history: MarketHistoryItem[] }>(
+        '/market/history',
+        { code, market, asset_type, period, interval: 'day' },
+        20 * 60 * 1000,
+      )
+      last = data
+      if ((data.history || []).length > 0) return data
+    }
+    return last || { code, market, history: [] }
+  },
+  fundamentals: (code: string, market: string, asset_type: string, options?: { force_refresh?: boolean }) => {
+    const normalPayload = { code, market, asset_type }
+    if (options?.force_refresh) {
+      return api.post<MarketFundamentalsResponse>('/market/fundamentals', { ...normalPayload, force_refresh: true }).then(r => {
+        setCached(cacheKey('/market/fundamentals', normalPayload), r.data, 60 * 60 * 1000)
+        return r.data
+      })
+    }
+    return postCached<MarketFundamentalsResponse>('/market/fundamentals', normalPayload, 60 * 60 * 1000)
+  },
 }
 
 export interface OcrAssetItem {

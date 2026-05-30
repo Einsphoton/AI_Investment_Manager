@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Card, Form, Input, Button, Switch, message, Space, Typography,
-  InputNumber, Modal, Row, Col, Select, Radio, Divider, Spin
+  InputNumber, Modal, Row, Col, Select, Radio, Divider, Spin, AutoComplete
 } from 'antd'
 import {
   ApiOutlined, ClockCircleOutlined, DownloadOutlined, UploadOutlined,
@@ -9,10 +9,31 @@ import {
   DatabaseOutlined, StockOutlined, BankOutlined, ReloadOutlined, DeleteOutlined,
   WarningOutlined, PlusOutlined, WalletOutlined
 } from '@ant-design/icons'
-import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, parallelApi, MarketProviders, InvestmentBudgetConfig, ParallelConfig } from '../api'
+import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, parallelApi, investmentAdviceApi, MarketProviders, InvestmentBudgetConfig, ParallelConfig } from '../api'
 
 const { Text, Paragraph } = Typography
 const goldStyle = { color: '#c9a84c' }
+
+const BUDGET_PLATFORM_OPTIONS = [
+  { value: '微信理财通' },
+  { value: '支付宝' },
+  { value: '招商银行' },
+  { value: '招商证券' },
+  { value: '富途牛牛' },
+  { value: '平安银行' },
+  { value: '中银国际' },
+  { value: '中国银行' },
+  { value: '工商银行' },
+  { value: '建设银行' },
+  { value: '东方财富' },
+  { value: '同花顺' },
+  { value: '华泰证券' },
+  { value: '广发证券' },
+  { value: '中信证券' },
+  { value: '老虎证券' },
+  { value: '雪球' },
+  { value: '天天基金' },
+]
 
 const PERSONALITIES: Record<string, { label: string; description: string }> = {
   balanced: { label: '均衡型', description: '风险与收益平衡，适合大多数投资者' },
@@ -124,7 +145,7 @@ export default function Settings() {
       ...budgetConfigs,
       {
         id: `budget-${Date.now()}`,
-        platform: '微信理财通',
+        platform: '',
         amount: 0,
         currency: 'CNY' as const,
         asset_types: ['stock', 'onshore_fund', 'offshore_fund'],
@@ -143,6 +164,15 @@ export default function Settings() {
   const removeBudgetConfig = async (id: string) => {
     await saveBudgetConfigs(budgetConfigs.filter(item => item.id !== id))
     message.success('已删除平台额度')
+  }
+
+  const handleResetBudget = async () => {
+    try {
+      const result = await investmentAdviceApi.resetBudget()
+      message.success(result.message)
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || '重置额度失败')
+    }
   }
 
   const fetchModels = async (target: 'ai' | 'ocr') => {
@@ -325,7 +355,7 @@ export default function Settings() {
             title={
               <Space>
                 <ApiOutlined style={goldStyle} />
-                <span>OpenAI API 配置</span>
+                <span>AI 分析模型配置</span>
               </Space>
             }
             style={{ marginBottom: 16 }}
@@ -386,102 +416,6 @@ export default function Settings() {
                 />
               </Form.Item>
 	            </Card>
-
-	            <Card
-	              title={
-	                <Space>
-	                  <WalletOutlined style={goldStyle} />
-	                  <span>AI 投资建议额度</span>
-	                </Space>
-	              }
-	              extra={
-	                <Button size="small" icon={<PlusOutlined />} onClick={addBudgetConfig} style={{ borderRadius: 8 }}>
-	                  添加平台
-	                </Button>
-	              }
-	              style={{ marginBottom: 16 }}
-	            >
-	              <Space direction="vertical" style={{ width: '100%' }} size="middle">
-	                {budgetConfigs.length === 0 ? (
-	                  <div style={{
-	                    padding: 18,
-	                    borderRadius: 10,
-	                    border: '1px dashed rgba(201,168,76,0.28)',
-	                    background: 'rgba(201,168,76,0.04)',
-	                    color: '#9a9892',
-	                    fontSize: 13,
-	                  }}>
-	                    尚未配置平台投资额度
-	                  </div>
-	                ) : null}
-	                {budgetConfigs.map(config => (
-	                  <div key={config.id} style={{
-	                    padding: '14px 16px',
-	                    borderRadius: 10,
-	                    background: 'rgba(26, 26, 36, 0.5)',
-	                    border: '1px solid rgba(255,255,255,0.05)',
-	                  }}>
-	                    <Row gutter={[10, 10]} align="middle">
-	                      <Col xs={24} md={9}>
-	                        <Input
-	                          value={config.platform}
-	                          placeholder="平台名称"
-	                          onChange={e => updateBudgetConfig(config.id, { platform: e.target.value })}
-	                        />
-	                      </Col>
-	                      <Col xs={12} md={7}>
-	                        <InputNumber
-	                          min={0}
-	                          value={config.amount}
-	                          placeholder="额度"
-	                          style={{ width: '100%' }}
-	                          onChange={v => updateBudgetConfig(config.id, { amount: Number(v || 0) })}
-	                        />
-	                      </Col>
-	                      <Col xs={12} md={6}>
-	                        <Select
-	                          value={config.currency}
-	                          options={CURRENCY_OPTIONS}
-	                          style={{ width: '100%' }}
-	                          onChange={v => updateBudgetConfig(config.id, { currency: v })}
-	                        />
-	                      </Col>
-	                      <Col xs={24} md={2} style={{ textAlign: 'right' }}>
-	                        <Button
-	                          danger
-	                          type="text"
-	                          icon={<DeleteOutlined />}
-	                          onClick={() => removeBudgetConfig(config.id)}
-	                        />
-	                      </Col>
-	                      <Col xs={24} md={12}>
-	                        <Select
-	                          mode="multiple"
-	                          value={config.asset_types}
-	                          options={ASSET_TYPE_OPTIONS}
-	                          placeholder="投资类型"
-	                          maxTagCount={2}
-	                          style={{ width: '100%' }}
-	                          onChange={v => updateBudgetConfig(config.id, { asset_types: v })}
-	                        />
-	                      </Col>
-	                      <Col xs={24} md={12}>
-	                        <Select
-	                          mode="multiple"
-	                          value={config.markets}
-	                          options={MARKET_OPTIONS}
-	                          placeholder="股市类型"
-	                          maxTagCount={3}
-	                          style={{ width: '100%' }}
-	                          onChange={v => updateBudgetConfig(config.id, { markets: v })}
-	                        />
-	                      </Col>
-	                    </Row>
-	                  </div>
-	                ))}
-	              </Space>
-	            </Card>
-
 	            <Card
 	              title={
               <Space>
@@ -569,9 +503,10 @@ export default function Settings() {
               )}
             </Space>
           </Card>
+
           </Form>
         </Col>
-          <Col xs={24} lg={12}>
+        <Col xs={24} lg={12}>
             <Card
               title={
                 <Space>
@@ -672,6 +607,7 @@ export default function Settings() {
               </Space>
             </Card>
 
+
             <Card
               title={
                 <Space>
@@ -763,141 +699,196 @@ export default function Settings() {
               </Space>
             </Card>
 
-            <Card
-              title={
-                <Space>
-                  <ClockCircleOutlined style={goldStyle} />
-                  <span>定时 AI 分析</span>
-                </Space>
-              }
-              style={{ marginBottom: 16 }}
-            >
-              <Space direction="vertical" style={{ width: '100%' }} size="large">
-                <div style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  padding: '16px 20px', borderRadius: 12,
-                  background: 'rgba(26, 26, 36, 0.5)',
-                  border: '1px solid rgba(255,255,255,0.04)',
-                }}>
-                  <Space direction="vertical" size={2}>
-                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>开启定时分析</Text>
-                    <Text style={{ color: '#5c5a55', fontSize: 12 }}>自动运行 AI 分析并生成报告</Text>
-                  </Space>
-                  <Switch checked={autoAnalyze} onChange={handleAutoAnalyzeChange} />
-                </div>
+        </Col>
+      </Row>
 
-                <div style={{
-                  padding: '16px 20px', borderRadius: 12,
-                  background: 'rgba(26, 26, 36, 0.5)',
-                  border: '1px solid rgba(255,255,255,0.04)',
-                }}>
-                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>交易日限制</Text>
-                    <Text style={{ color: '#5c5a55', fontSize: 12, marginBottom: 8 }}>
-                      选择后，仅在所选市场的交易日运行分析（周末及法定节假日跳过）
-                    </Text>
-                    <Select
-                      mode="multiple"
-                      value={markets}
-                      onChange={async (v: string[]) => {
-                        setMarkets(v)
-                        await settingsApi.update('auto_analyze_markets', v.join(','))
-                        message.success('交易日限制已更新')
-                      }}
-                      placeholder="不限制（每天都运行）"
-                      style={{ width: '100%' }}
-                      options={MARKET_OPTIONS}
-                      maxTagCount={3}
-                    />
-                    {markets.length > 0 && (
-                      <Text style={{ color: '#9a9892', fontSize: 11, marginTop: 4 }}>
-                        分析将在 {markets.map(m => MARKET_OPTIONS.find(o => o.value === m)?.label).join('、')} 的交易日运行
-                      </Text>
-                    )}
-                  </Space>
-                </div>
+      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
+        <Col xs={24}>
+	            <div style={{
+	              background: 'rgba(26, 26, 36, 0.5)',
+	              border: '1px solid rgba(255,255,255,0.05)',
+	              borderRadius: 12,
+	              marginBottom: 16,
+	              overflow: 'hidden',
+	            }}>
+	              {/* Header */}
+	              <div style={{
+	                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+	                padding: '14px 20px',
+	                borderBottom: '1px solid rgba(255,255,255,0.06)',
+	              }}>
+	                <Space>
+	                  <WalletOutlined style={goldStyle} />
+	                  <span style={{ fontSize: 15, fontWeight: 600, color: '#e8e6e3' }}>AI 投资建议额度</span>
+	                </Space>
+	                <Space size={8}>
+	                  <Button size="small" icon={<ReloadOutlined />} onClick={handleResetBudget} style={{ borderRadius: 8 }}>
+	                    重置额度
+	                  </Button>
+	                  <Button size="small" icon={<PlusOutlined />} onClick={addBudgetConfig} style={{ borderRadius: 8 }}>
+	                    添加平台
+	                  </Button>
+	                </Space>
+	              </div>
+	              {budgetConfigs.length === 0 ? (
+	                <div style={{
+	                  padding: 18,
+	                  borderRadius: 10,
+	                  border: '1px dashed rgba(201,168,76,0.28)',
+	                  background: 'rgba(201,168,76,0.04)',
+	                  color: '#9a9892',
+	                  fontSize: 13,
+	                  textAlign: 'center',
+	                  margin: 16,
+	                }}>
+	                  尚未配置平台投资额度
+	                </div>
+	              ) : (
+	                <>
+	                  {/* Column headers */}
+	                  <div style={{
+	                    display: 'flex', alignItems: 'center', gap: 12,
+	                    padding: '8px 20px',
+	                    borderBottom: '1px solid rgba(255,255,255,0.04)',
+	                    background: 'rgba(0,0,0,0.15)',
+	                  }}>
+	                    <div style={{ color: '#5c5a55', fontSize: 11, fontWeight: 500, minWidth: 155 }}>平台名称</div>
+	                    <div style={{ color: '#5c5a55', fontSize: 11, fontWeight: 500, minWidth: 100 }}>投资额度</div>
+	                    <div style={{ color: '#5c5a55', fontSize: 11, fontWeight: 500, minWidth: 70 }}>货币</div>
+	                    <div style={{ color: '#5c5a55', fontSize: 11, fontWeight: 500, flex: 1 }}>配置</div>
+	                    <div style={{ width: 32 }}></div>
+	                  </div>
+	                  {/* Items */}
+	                  {budgetConfigs.map((config, idx) => (
+	                    <div key={config.id} style={{
+	                      display: 'flex', alignItems: 'center', gap: 12,
+	                      padding: '10px 20px',
+	                      borderBottom: idx < budgetConfigs.length - 1 ? '1px solid rgba(255,255,255,0.04)' : 'none',
+	                      transition: 'background 0.15s',
+	                    }}
+	                    onMouseEnter={e => (e.currentTarget.style.background = 'rgba(201,168,76,0.04)')}
+	                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+	                    >
+	                      {/* Platform */}
+	                      <div style={{ minWidth: 155 }}>
+	                        						<AutoComplete
+						  value={config.platform}
+						  options={BUDGET_PLATFORM_OPTIONS}
+						  placeholder="选择或输入平台"
+						  allowClear
+						  filterOption={(inputValue, option) =>
+						    (option?.value as string || '').toUpperCase().includes(inputValue.toUpperCase())
+						  }
+						  onChange={v => updateBudgetConfig(config.id, { platform: v as string })}
+						  style={{ width: '100%' }}
+						/>
+	                      </div>
+	                      {/* Amount */}
+	                      <div style={{ minWidth: 100 }}>
+	                        <InputNumber
+	                          min={0}
+	                          value={config.amount}
+	                          placeholder="100000"
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { amount: Number(v || 0) })}
+	                        />
+	                      </div>
+	                      {/* Currency */}
+	                      <div style={{ minWidth: 70 }}>
+	                        <Select
+	                          value={config.currency}
+	                          options={CURRENCY_OPTIONS}
+	                          style={{ width: '100%' }}
+	                          onChange={v => updateBudgetConfig(config.id, { currency: v })}
+	                        />
+	                      </div>
+	                      {/* Tags row: asset types + markets */}
+	                      <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+	                        <div style={{ display: 'flex', gap: 3, flexWrap: 'nowrap', flexShrink: 0 }}>
+	                          {ASSET_TYPE_OPTIONS.map(opt => {
+	                            const checked = config.asset_types.includes(opt.value)
+	                            return (
+	                              <span
+	                                key={opt.value}
+	                                onClick={() => {
+	                                  const next = checked
+	                                    ? config.asset_types.filter(v => v !== opt.value)
+	                                    : [...config.asset_types, opt.value]
+	                                  updateBudgetConfig(config.id, { asset_types: next })
+	                                }}
+	                                style={{
+	                                  display: 'inline-block',
+	                                  padding: '1px 8px',
+	                                  borderRadius: 4,
+	                                  fontSize: 11,
+	                                  lineHeight: '20px',
+	                                  cursor: 'pointer',
+	                                  background: checked ? 'rgba(201, 168, 76, 0.2)' : 'rgba(255,255,255,0.06)',
+	                                  border: checked ? '1px solid rgba(201,168,76,0.5)' : '1px solid transparent',
+	                                  color: checked ? '#c9a84c' : '#9a9892',
+	                                  whiteSpace: 'nowrap',
+	                                  userSelect: 'none',
+	                                }}
+	                              >
+	                                {opt.label}
+	                              </span>
+	                            )
+	                          })}
+	                        </div>
+	                        <span style={{ color: 'rgba(255,255,255,0.08)', fontSize: 14, flexShrink: 0 }}>|</span>
+	                        <div style={{ display: 'flex', gap: 3, flexWrap: 'nowrap', flexShrink: 0 }}>
+	                          {MARKET_OPTIONS.map(opt => {
+	                            const checked = config.markets.includes(opt.value)
+	                            return (
+	                              <span
+	                                key={opt.value}
+	                                onClick={() => {
+	                                  const next = checked
+	                                    ? config.markets.filter(v => v !== opt.value)
+	                                    : [...config.markets, opt.value]
+	                                  updateBudgetConfig(config.id, { markets: next })
+	                                }}
+	                                style={{
+	                                  display: 'inline-block',
+	                                  padding: '1px 8px',
+	                                  borderRadius: 4,
+	                                  fontSize: 11,
+	                                  lineHeight: '20px',
+	                                  cursor: 'pointer',
+	                                  background: checked ? 'rgba(201, 168, 76, 0.2)' : 'rgba(255,255,255,0.06)',
+	                                  border: checked ? '1px solid rgba(201,168,76,0.5)' : '1px solid transparent',
+	                                  color: checked ? '#c9a84c' : '#9a9892',
+	                                  whiteSpace: 'nowrap',
+	                                  userSelect: 'none',
+	                                }}
+	                              >
+	                                {opt.label}
+	                              </span>
+	                            )
+	                          })}
+	                        </div>
+	                      </div>
+	                      {/* Delete */}
+	                      <div style={{ width: 32, display: 'flex', justifyContent: 'center' }}>
+	                        <Button
+	                          danger
+	                          type="text"
+	                          icon={<DeleteOutlined />}
+	                          onClick={() => removeBudgetConfig(config.id)}
+	                          style={{ height: 28, width: 28 }}
+	                        />
+	                      </div>
+	                    </div>
+	                  ))}
+	                </>
+	              )}
+	            </div>
 
-                <div style={{
-                  padding: '16px 20px', borderRadius: 12,
-                  background: 'rgba(26, 26, 36, 0.5)',
-                  border: '1px solid rgba(255,255,255,0.04)',
-                }}>
-                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>分析间隔</Text>
-                    <Text style={{ color: '#5c5a55', fontSize: 12, marginBottom: 8 }}>
-                      选择分析频率和间隔时间
-                    </Text>
-                    <Space style={{ width: '100%' }}>
-                      <Select
-                        value={intervalType}
-                        onChange={async (v: string) => {
-                          setIntervalType(v)
-                          await settingsApi.update('auto_analyze_interval_type', v)
-                          message.success('间隔类型已更新')
-                        }}
-                        style={{ width: 130 }}
-                        options={Object.entries(SCHEDULER_INTERVAL_TYPES).map(([k, v]) => ({
-                          value: k, label: v,
-                        }))}
-                      />
-                      {intervalType !== 'daily' ? (
-                        <InputNumber
-                          min={intervalType === 'minutes' ? 5 : 1}
-                          max={intervalType === 'minutes' ? 1440 : 72}
-                          value={intervalValue}
-                          onChange={async (v) => {
-                            if (!v) return
-                            setIntervalValue(v)
-                            await settingsApi.update('auto_analyze_interval_value', String(v))
-                            message.success(`间隔已设为每 ${v} ${intervalType === 'minutes' ? '分钟' : '小时'}`)
-                          }}
-                          style={{ width: 100 }}
-                          addonAfter={intervalType === 'minutes' ? '分钟' : '小时'}
-                        />
-                      ) : (
-                        <Space>
-                          <Input
-                            type="time"
-                            value={dailyTime}
-                            onChange={async (e) => {
-                              const t = e.target.value
-                              setDailyTime(t)
-                              await settingsApi.update('auto_analyze_time', t)
-                              message.success(`每日分析时间已设为 ${t}`)
-                            }}
-                            style={{ width: 130 }}
-                          />
-                          <Text style={{ color: '#5c5a55', fontSize: 12 }}>运行</Text>
-                        </Space>
-                      )}
-                    </Space>
-                  </Space>
-                </div>
+        </Col>
+      </Row>
 
-                <div style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  padding: '16px 20px', borderRadius: 12,
-                  background: 'rgba(26, 26, 36, 0.5)',
-                  border: '1px solid rgba(255,255,255,0.04)',
-                }}>
-                  <Space direction="vertical" size={2}>
-                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>AI 推荐标的</Text>
-                    <Text style={{ color: '#5c5a55', fontSize: 12 }}>
-                      定时分析时同时启动 AI 标的推荐
-                    </Text>
-                  </Space>
-                  <Switch
-                    checked={includeTargets}
-                    onChange={async (checked) => {
-                      setIncludeTargets(checked)
-                      await settingsApi.update('auto_analyze_include_targets', String(checked))
-                      message.success(checked ? '已开启定时推荐标的' : '已关闭定时推荐标的')
-                    }}
-                  />
-                </div>
-              </Space>
-            </Card>
-
+      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
+        <Col xs={24} lg={12}>
           <Card
             title={
               <Space>
@@ -1098,6 +1089,7 @@ export default function Settings() {
             </Space>
           </Card>
 
+
           <Card
             title={
               <Space>
@@ -1179,7 +1171,145 @@ export default function Settings() {
             </Space>
           </Card>
         </Col>
+        <Col xs={24} lg={12}>
+            <Card
+              title={
+                <Space>
+                  <ClockCircleOutlined style={goldStyle} />
+                  <span>定时 AI 分析</span>
+                </Space>
+              }
+              style={{ marginBottom: 16 }}
+            >
+              <Space direction="vertical" style={{ width: '100%' }} size="large">
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '16px 20px', borderRadius: 12,
+                  background: 'rgba(26, 26, 36, 0.5)',
+                  border: '1px solid rgba(255,255,255,0.04)',
+                }}>
+                  <Space direction="vertical" size={2}>
+                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>开启定时分析</Text>
+                    <Text style={{ color: '#5c5a55', fontSize: 12 }}>自动运行 AI 分析并生成报告</Text>
+                  </Space>
+                  <Switch checked={autoAnalyze} onChange={handleAutoAnalyzeChange} />
+                </div>
+
+                <div style={{
+                  padding: '16px 20px', borderRadius: 12,
+                  background: 'rgba(26, 26, 36, 0.5)',
+                  border: '1px solid rgba(255,255,255,0.04)',
+                }}>
+                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>交易日限制</Text>
+                    <Text style={{ color: '#5c5a55', fontSize: 12, marginBottom: 8 }}>
+                      选择后，仅在所选市场的交易日运行分析（周末及法定节假日跳过）
+                    </Text>
+                    <Select
+                      mode="multiple"
+                      value={markets}
+                      onChange={async (v: string[]) => {
+                        setMarkets(v)
+                        await settingsApi.update('auto_analyze_markets', v.join(','))
+                        message.success('交易日限制已更新')
+                      }}
+                      placeholder="不限制（每天都运行）"
+                      style={{ width: '100%' }}
+                      options={MARKET_OPTIONS}
+                      maxTagCount={3}
+                    />
+                    {markets.length > 0 && (
+                      <Text style={{ color: '#9a9892', fontSize: 11, marginTop: 4 }}>
+                        分析将在 {markets.map(m => MARKET_OPTIONS.find(o => o.value === m)?.label).join('、')} 的交易日运行
+                      </Text>
+                    )}
+                  </Space>
+                </div>
+
+                <div style={{
+                  padding: '16px 20px', borderRadius: 12,
+                  background: 'rgba(26, 26, 36, 0.5)',
+                  border: '1px solid rgba(255,255,255,0.04)',
+                }}>
+                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>分析间隔</Text>
+                    <Text style={{ color: '#5c5a55', fontSize: 12, marginBottom: 8 }}>
+                      选择分析频率和间隔时间
+                    </Text>
+                    <Space style={{ width: '100%' }}>
+                      <Select
+                        value={intervalType}
+                        onChange={async (v: string) => {
+                          setIntervalType(v)
+                          await settingsApi.update('auto_analyze_interval_type', v)
+                          message.success('间隔类型已更新')
+                        }}
+                        style={{ width: 130 }}
+                        options={Object.entries(SCHEDULER_INTERVAL_TYPES).map(([k, v]) => ({
+                          value: k, label: v,
+                        }))}
+                      />
+                      {intervalType !== 'daily' ? (
+                        <InputNumber
+                          min={intervalType === 'minutes' ? 5 : 1}
+                          max={intervalType === 'minutes' ? 1440 : 72}
+                          value={intervalValue}
+                          onChange={async (v) => {
+                            if (!v) return
+                            setIntervalValue(v)
+                            await settingsApi.update('auto_analyze_interval_value', String(v))
+                            message.success(`间隔已设为每 ${v} ${intervalType === 'minutes' ? '分钟' : '小时'}`)
+                          }}
+                          style={{ width: 100 }}
+                          addonAfter={intervalType === 'minutes' ? '分钟' : '小时'}
+                        />
+                      ) : (
+                        <Space>
+                          <Input
+                            type="time"
+                            value={dailyTime}
+                            onChange={async (e) => {
+                              const t = e.target.value
+                              setDailyTime(t)
+                              await settingsApi.update('auto_analyze_time', t)
+                              message.success(`每日分析时间已设为 ${t}`)
+                            }}
+                            style={{ width: 130 }}
+                          />
+                          <Text style={{ color: '#5c5a55', fontSize: 12 }}>运行</Text>
+                        </Space>
+                      )}
+                    </Space>
+                  </Space>
+                </div>
+
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '16px 20px', borderRadius: 12,
+                  background: 'rgba(26, 26, 36, 0.5)',
+                  border: '1px solid rgba(255,255,255,0.04)',
+                }}>
+                  <Space direction="vertical" size={2}>
+                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>AI 推荐标的</Text>
+                    <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                      定时分析时同时启动 AI 标的推荐
+                    </Text>
+                  </Space>
+                  <Switch
+                    checked={includeTargets}
+                    onChange={async (checked) => {
+                      setIncludeTargets(checked)
+                      await settingsApi.update('auto_analyze_include_targets', String(checked))
+                      message.success(checked ? '已开启定时推荐标的' : '已关闭定时推荐标的')
+                    }}
+                  />
+                </div>
+              </Space>
+            </Card>
+
+        </Col>
       </Row>
+
 
       <input
         type="file"

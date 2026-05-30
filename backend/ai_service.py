@@ -1,5 +1,7 @@
 import json
+import hashlib
 from openai import OpenAI
+from fastapi import HTTPException
 from models import Asset, Settings, AnalysisRecord
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -20,6 +22,22 @@ def set_setting(db: Session, key: str, value: str):
     db.commit()
 
 
+def safe_key_fingerprint(api_key: str) -> dict:
+    value = api_key or ""
+    return {
+        "length": len(value),
+        "prefix": value[:6],
+        "suffix": value[-4:] if value else "",
+        "sha12": hashlib.sha256(value.encode()).hexdigest()[:12] if value else "",
+    }
+
+
+def openai_runtime_summary(api_key: str, base_url: str, model: str) -> str:
+    fp = safe_key_fingerprint(api_key)
+    key_label = f"{fp['prefix']}...{fp['suffix']} len={fp['length']} sha12={fp['sha12']}" if fp["length"] else "未配置"
+    return f"base_url={base_url or 'https://api.openai.com/v1'}, model={model}, key={key_label}"
+
+
 def run_ai_analysis(db: Session) -> AnalysisRecord:
     api_key = get_setting(db, "openai_api_key")
     base_url = get_setting(db, "openai_base_url")
@@ -28,16 +46,7 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
     report_style = get_setting(db, "ai_report_style") or "professional"
 
     if not api_key:
-        record = AnalysisRecord(
-            summary="AI 分析暂不可用",
-            detail="请先在设置页面配置 OpenAI API Key",
-            total_market_value=0, total_cost=0, total_pnl=0,
-            total_pnl_percent=0, realized_pnl=0,
-        )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record
+        raise HTTPException(status_code=400, detail="请先在设置页面配置 OpenAI API Key")
 
     from agent.personality import build_system_prompt
     system_prompt = build_system_prompt(personality, report_style)
@@ -112,8 +121,8 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
         summary = result.get("summary", "分析完成")
         detail = result.get("detail", "")
     except Exception as e:
-        summary = "AI 分析失败"
-        detail = f"错误信息：{str(e)}"
+        runtime = openai_runtime_summary(api_key, base_url, model)
+        raise HTTPException(status_code=502, detail=f"AI 分析失败: {str(e)}；当前使用配置：{runtime}")
 
     record = AnalysisRecord(
         summary=summary, detail=detail,

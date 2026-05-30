@@ -17,8 +17,9 @@ import {
 } from 'recharts'
 import {
   assetsApi, marketApi, analysisApi, Asset, AssetDetail,
-  AssetTransaction, MarketFundamentals, MarketHistoryItem
+  AssetTransaction, MarketFundamentals, MarketHistoryItem, transformMarketHistory
 } from '../api'
+import { NetValueRangeSelector, type NetValuePeriod } from '../components/MarketCharts'
 
 const { Text } = Typography
 
@@ -198,26 +199,91 @@ export default function Assets() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null)
   const [assetDetail, setAssetDetail] = useState<AssetDetail | null>(null)
+  const [detailFullHistory, setDetailFullHistory] = useState<MarketHistoryItem[]>([])
+  const [detailHistoryLoading, setDetailHistoryLoading] = useState(false)
+  const [detailFundamentalsLoading, setDetailFundamentalsLoading] = useState(false)
   const [transactionModalOpen, setTransactionModalOpen] = useState(false)
   const [savingTransaction, setSavingTransaction] = useState(false)
+  const [assetListPeriod, setAssetListPeriod] = useState<NetValuePeriod>('1m')
+  const [detailPeriod, setDetailPeriod] = useState<NetValuePeriod>('6m')
 
   const lastAutoNameRef = useRef<string | null>(null)
   const lookupSeqRef = useRef(0)
+  const priceHistorySeqRef = useRef(0)
+  const detailHistoryPrefetchKeyRef = useRef<string | null>(null)
+  const marketWarmupSeqRef = useRef(0)
 
-  const fetchPriceHistory = useCallback(async (assets: Asset[]) => {
-    const results: Record<number, MarketHistoryItem[]> = {}
-    await Promise.allSettled(assets.map(async (a) => {
-      try {
-        const data = await marketApi.history(a.code, a.market, a.asset_type)
-        if (data.history.length > 0) {
-          results[a.id] = data.history
+  const idleDelay = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
+
+  const fetchPriceHistory = useCallback(async (assets: Asset[], period: NetValuePeriod = assetListPeriod) => {
+    const seq = priceHistorySeqRef.current + 1
+    priceHistorySeqRef.current = seq
+    const nextResults: Record<number, MarketHistoryItem[]> = {}
+    const queue = [...assets].filter(a => a.code)
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const a = queue[cursor]
+        cursor += 1
+        if (!a) continue
+        try {
+          const data = await marketApi.history(a.code, a.market, a.asset_type, { period, interval: 'day' })
+          if (seq !== priceHistorySeqRef.current) return
+          if (data.history.length > 0) {
+            nextResults[a.id] = data.history
+            setPriceHistory(prev => ({ ...prev, [a.id]: data.history }))
+          }
+        } catch {
+          // silent
         }
-      } catch (e) {
-        // silent
       }
-    }))
-    setPriceHistory(results)
-  }, [])
+    }
+    await Promise.allSettled(Array.from({ length: Math.min(1, queue.length) }, worker))
+    if (seq !== priceHistorySeqRef.current) return
+    setPriceHistory(prev => ({ ...prev, ...nextResults }))
+  }, [assetListPeriod])
+
+  const warmAssetsMarketData = useCallback((assetList: Asset[]) => {
+    const seq = marketWarmupSeqRef.current + 1
+    marketWarmupSeqRef.current = seq
+    const liveAssets = assetList.filter(asset => asset.code)
+
+    window.setTimeout(async () => {
+      for (const asset of liveAssets) {
+        if (seq !== marketWarmupSeqRef.current) return
+        try {
+          const quote = await marketApi.quote(asset.code, asset.market, asset.asset_type)
+          if (quote.current_price != null) {
+            setAssets(prev => prev.map(item => (
+              item.id === asset.id
+                ? { ...item, current_price: quote.current_price, price_updated_at: new Date().toISOString() }
+                : item
+            )))
+          }
+        } catch {}
+        await idleDelay(220)
+      }
+
+      for (const asset of liveAssets) {
+        if (seq !== marketWarmupSeqRef.current) return
+        try {
+          const data = await marketApi.history(asset.code, asset.market, asset.asset_type, { period: assetListPeriod, interval: 'day' })
+          if ((data.history || []).length > 0) {
+            setPriceHistory(prev => ({ ...prev, [asset.id]: data.history || [] }))
+          }
+        } catch {}
+        await idleDelay(260)
+      }
+
+      for (const asset of liveAssets) {
+        if (seq !== marketWarmupSeqRef.current) return
+        try {
+          await marketApi.fundamentals(asset.code, asset.market, asset.asset_type)
+        } catch {}
+        await idleDelay(360)
+      }
+    }, 500)
+  }, [assetListPeriod])
 
   const fetchAssets = async () => {
     setLoading(true)
@@ -238,7 +304,7 @@ export default function Assets() {
       await assetsApi.refreshPrices()
       const data = await assetsApi.list()
       setAssets(data)
-      await fetchPriceHistory(data)
+      fetchPriceHistory(data, assetListPeriod)
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '刷新行情失败')
     } finally {
@@ -322,11 +388,17 @@ export default function Assets() {
     const init = async () => {
       const data = await fetchAssets()
       if (data && data.length > 0) {
-        await refreshPrices()
+        warmAssetsMarketData(data)
       }
     }
     init()
   }, [])
+
+  useEffect(() => {
+    if (assets.length > 0) {
+      fetchPriceHistory(assets, assetListPeriod)
+    }
+  }, [assetListPeriod])
 
   const openAddModal = () => {
     setEditingAsset(null)
@@ -430,7 +502,15 @@ export default function Assets() {
     setDetailLoading(true)
     try {
       const detail = await assetsApi.detail(asset.id)
-      setAssetDetail(detail)
+      setAssetDetail(prev => (
+        prev?.asset.id === detail.asset.id
+          ? {
+              ...detail,
+              history: prev.history?.length ? prev.history : detail.history,
+              fundamentals: Object.keys(prev.fundamentals || {}).length ? prev.fundamentals : detail.fundamentals,
+            }
+          : detail
+      ))
       setSelectedAsset(detail.asset)
       return detail
     } catch (e: any) {
@@ -449,10 +529,82 @@ export default function Assets() {
 
   const openDetailModal = async (asset: Asset) => {
     setSelectedAsset(asset)
-    setAssetDetail(null)
+    setAssetDetail({
+      asset,
+      history: priceHistory[asset.id] || [],
+      fundamentals: {},
+      transactions: [],
+      latest_analysis: null,
+    })
+    setDetailFullHistory([])
+    setDetailPeriod('6m')
     setDetailOpen(true)
-    await loadAssetDetail(asset)
+    loadAssetDetail(asset)
   }
+
+  useEffect(() => {
+    if (!detailOpen || !selectedAsset || !assetDetail) return
+    let active = true
+    const realtimeAsset = selectedAsset.asset_type !== 'offshore_fund'
+    if (detailFullHistory.length > 0) {
+      setAssetDetail(prev => prev ? { ...prev, history: transformMarketHistory(detailFullHistory, detailPeriod, 'day') } : prev)
+      if (!realtimeAsset) {
+        return () => { active = false }
+      }
+    }
+    const fallback = priceHistory[selectedAsset.id]
+    if (fallback?.length) {
+      setAssetDetail(prev => prev ? { ...prev, history: fallback } : prev)
+    }
+    setDetailHistoryLoading(true)
+    marketApi.history(selectedAsset.code, selectedAsset.market, selectedAsset.asset_type, { period: detailPeriod, interval: 'day', force_refresh: realtimeAsset })
+      .then(data => {
+        if (!active) return
+        if ((data.history || []).length > 0) {
+          setAssetDetail(prev => prev ? { ...prev, history: data.history || [] } : prev)
+          if (realtimeAsset) {
+            const latest = data.history[data.history.length - 1]
+            if (latest?.price) {
+              const updatedAt = new Date().toISOString()
+              setSelectedAsset(prev => prev ? { ...prev, current_price: latest.price, price_updated_at: updatedAt } : prev)
+              setAssetDetail(prev => prev ? { ...prev, asset: { ...prev.asset, current_price: latest.price, price_updated_at: updatedAt } } : prev)
+              setAssets(prev => prev.map(item => item.id === selectedAsset.id ? { ...item, current_price: latest.price, price_updated_at: updatedAt } : item))
+            }
+          }
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (active) setDetailHistoryLoading(false) })
+
+    const prefetchKey = `${selectedAsset.id}:${selectedAsset.code}:${selectedAsset.market}:${selectedAsset.asset_type}`
+    if (detailHistoryPrefetchKeyRef.current !== prefetchKey) {
+      detailHistoryPrefetchKeyRef.current = prefetchKey
+      window.setTimeout(() => {
+        marketApi.historyFullRaw(selectedAsset.code, selectedAsset.market, selectedAsset.asset_type)
+          .then(data => {
+            if ((data.history || []).length > 0) {
+              setDetailFullHistory(data.history || [])
+            }
+          })
+          .catch(() => {})
+      }, 600)
+    }
+    return () => { active = false }
+  }, [detailPeriod, detailOpen, selectedAsset?.id, assetDetail?.asset.id, detailFullHistory.length])
+
+  useEffect(() => {
+    if (!detailOpen || !selectedAsset || !assetDetail) return
+    let active = true
+    setDetailFundamentalsLoading(true)
+    marketApi.fundamentals(selectedAsset.code, selectedAsset.market, selectedAsset.asset_type)
+      .then(data => {
+        if (!active) return
+        setAssetDetail(prev => prev ? { ...prev, fundamentals: data.fundamentals || {} } : prev)
+      })
+      .catch(() => {})
+      .finally(() => { if (active) setDetailFundamentalsLoading(false) })
+    return () => { active = false }
+  }, [detailOpen, selectedAsset?.id, assetDetail?.asset.id])
 
   const openTransactionModal = () => {
     const asset = assetDetail?.asset || selectedAsset
@@ -741,21 +893,26 @@ export default function Assets() {
     }]
   }
 
-  const buildChartData = (detail: AssetDetail) => {
+  const buildChartData = (detail: AssetDetail, useSyntheticFallback = true) => {
     const asset = detail.asset
     let base = (detail.history || [])
       .filter(item => item.date && item.price)
       .sort((a, b) => a.date.localeCompare(b.date))
 
+    if (base.length < 2 && !useSyntheticFallback) {
+      return []
+    }
+
     if (base.length < 2) {
       const start = dayjs(asset.buy_date || asset.created_at)
       const end = dayjs()
-      const days = Math.max(14, Math.min(60, end.diff(start, 'day') || 14))
+      const calendarDays = Math.max(1, end.diff(start, 'day') || 1)
+      const days = Math.max(2, Math.min(60, calendarDays + 1))
       const current = asset.current_price || asset.buy_price
       base = Array.from({ length: days }, (_, i) => {
         const ratio = days === 1 ? 1 : i / (days - 1)
         return {
-          date: start.add(i, 'day').format('YYYY-MM-DD'),
+          date: start.add(Math.round(ratio * calendarDays), 'day').format('YYYY-MM-DD'),
           price: asset.buy_price + (current - asset.buy_price) * ratio,
         }
       })
@@ -1072,6 +1229,8 @@ export default function Assets() {
         }
         extra={
           <Space>
+            <Text style={{ color: '#9a9892', fontSize: 12 }}>时间段</Text>
+            <NetValueRangeSelector value={assetListPeriod} onChange={setAssetListPeriod} />
             <Button
               icon={<ThunderboltOutlined />}
               onClick={handleAnalyzeAll}
@@ -1268,8 +1427,9 @@ export default function Assets() {
             <Spin />
           </div>
         ) : assetDetail ? (() => {
-          const chartData = buildChartData(assetDetail)
-          const markers = getTradeMarkers(assetDetail, chartData)
+          const hasRealHistory = (assetDetail.history || []).length >= 2
+          const chartData = buildChartData(assetDetail, true)
+          const markers = chartData.length > 0 ? getTradeMarkers(assetDetail, chartData) : []
           const asset = assetDetail.asset
           const effectivePrice = asset.current_price != null && asset.current_price > 0 ? asset.current_price : asset.buy_price
           const marketValue = asset.shares * effectivePrice
@@ -1319,21 +1479,48 @@ export default function Assets() {
                               <StockOutlined style={goldStyle} />
                               <Text strong style={{ color: '#e8e6e3' }}>净值曲线</Text>
                             </Space>
-                            <Button icon={<PlusCircleOutlined />} type="primary" onClick={openTransactionModal} style={{ borderRadius: 10 }}>
-                              添加交易记录
-                            </Button>
+                            <Space wrap>
+                              <Text style={{ color: '#9a9892', fontSize: 12 }}>时间段</Text>
+                              <NetValueRangeSelector value={detailPeriod} onChange={setDetailPeriod} />
+                              <Button icon={<PlusCircleOutlined />} type="primary" onClick={openTransactionModal} style={{ borderRadius: 10 }}>
+                                添加交易记录
+                              </Button>
+                            </Space>
                           </div>
-                          <div style={{ height: 360 }}>
-                            <ResponsiveContainer width="100%" height="100%">
-                              <LineChart data={chartData} margin={{ top: 16, right: 24, left: 0, bottom: 8 }}>
-                                <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-                                <XAxis dataKey="date" stroke="#5c5a55" tick={{ fontSize: 11 }} minTickGap={28} />
-                                <YAxis stroke="#5c5a55" tick={{ fontSize: 11 }} width={58} tickFormatter={(v) => Number(v).toFixed(2)} domain={['auto', 'auto']} />
-                                <ChartTooltip content={renderChartTooltip} />
-                                <Line type="monotone" dataKey="price" stroke="#c9a84c" strokeWidth={2} dot={false} activeDot={{ r: 5, stroke: '#111118', strokeWidth: 2 }} />
-                                <Scatter data={markers} dataKey="price" shape={renderTradeMarker} />
-                              </LineChart>
-                            </ResponsiveContainer>
+                          <div style={{ height: 360, position: 'relative' }}>
+                            {chartData.length >= 2 ? (
+                              <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={chartData} margin={{ top: 16, right: 24, left: 0, bottom: 8 }}>
+                                  <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
+                                  <XAxis dataKey="date" stroke="#5c5a55" tick={{ fontSize: 11 }} minTickGap={28} />
+                                  <YAxis stroke="#5c5a55" tick={{ fontSize: 11 }} width={58} tickFormatter={(v) => Number(v).toFixed(2)} domain={['auto', 'auto']} />
+                                  <ChartTooltip content={renderChartTooltip} />
+                                  <Line type="monotone" dataKey="price" stroke="#c9a84c" strokeWidth={2} dot={false} activeDot={{ r: 5, stroke: '#111118', strokeWidth: 2 }} />
+                                  <Scatter data={markers} dataKey="price" shape={renderTradeMarker} />
+                                </LineChart>
+                              </ResponsiveContainer>
+                            ) : (
+                              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="该时间段暂无可用净值数据" style={{ paddingTop: 96 }} />
+                            )}
+                            {detailHistoryLoading && (
+                              <div style={{
+                                position: 'absolute',
+                                top: 8,
+                                right: 8,
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 6,
+                                padding: '4px 8px',
+                                borderRadius: 8,
+                                background: 'rgba(17, 17, 24, 0.82)',
+                                border: '1px solid rgba(201,168,76,0.12)',
+                                color: '#9a9892',
+                                fontSize: 12,
+                              }}>
+                                <Spin size="small" />
+                                {hasRealHistory ? '更新中' : '加载真实走势'}
+                              </div>
+                            )}
                           </div>
                         </div>
 
@@ -1342,7 +1529,11 @@ export default function Assets() {
                             <div style={panelStyle}>
                               <Text strong style={{ color: '#e8e6e3' }}>{isFundAsset ? '基金信息' : '基本面数据'}</Text>
                               <Divider style={{ margin: '12px 0', borderColor: 'rgba(255,255,255,0.08)' }} />
-                              {Object.keys(assetDetail.fundamentals || {}).length === 0 ? (
+                              {detailFundamentalsLoading ? (
+                                <div style={{ minHeight: 120, display: 'grid', placeItems: 'center' }}>
+                                  <Spin />
+                                </div>
+                              ) : Object.keys(assetDetail.fundamentals || {}).length === 0 ? (
                                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={isFundAsset ? '暂无基金信息' : '暂无基本面数据'} />
                               ) : (
                                 <Space direction="vertical" size={12} style={{ width: '100%' }}>

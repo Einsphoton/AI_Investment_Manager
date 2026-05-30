@@ -43,6 +43,7 @@ class AssetResponse(BaseModel):
     current_price: Optional[float]
     price_updated_at: str
     note: str
+    source: str = "manual"
     created_at: datetime
     updated_at: datetime
 
@@ -203,6 +204,9 @@ class InvestmentAdviceResponse(BaseModel):
     summary: str
     advice: list[dict] = []
     budget_status: list[dict] = []
+    market_context: dict = {}
+    market_snapshot: dict = {}
+    decision_audit: list[dict] = []
 
 
 class MarketLookupRequest(BaseModel):
@@ -221,6 +225,7 @@ class MarketQuoteRequest(BaseModel):
     code: str
     market: str
     asset_type: str
+    force_refresh: bool = False
 
 
 class MarketQuoteResponse(BaseModel):
@@ -254,6 +259,9 @@ class MarketHistoryRequest(BaseModel):
     code: str
     market: str
     asset_type: str
+    period: str = "6m"
+    interval: str = "day"
+    force_refresh: bool = False
 
 
 class MarketHistoryItem(BaseModel):
@@ -274,6 +282,7 @@ class MarketFundamentalsRequest(BaseModel):
     code: str
     market: str
     asset_type: str
+    force_refresh: bool = False
 
 
 class MarketFundamentalsResponse(BaseModel):
@@ -304,3 +313,15 @@ class OcrParseResponse(BaseModel):
 
 class AssetsBatchCreate(BaseModel):
     assets: list[AssetCreate]
+
+class RecommendationStatsResponse(BaseModel):
+    id: int
+    added_count: int
+    removed_count: int
+    maintained_count: int
+    total_after: int
+    summary: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

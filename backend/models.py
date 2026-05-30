@@ -18,6 +18,7 @@ class Asset(Base):
     current_price = Column(Float, default=None, nullable=True)
     price_updated_at = Column(String(20), default="")
     note = Column(Text, default="")
+    source = Column(String(20), default="manual")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -97,4 +98,15 @@ class InvestmentAdviceRecord(Base):
     summary = Column(Text, default="")
     advice_json = Column(Text, default="[]")
     budget_status_json = Column(Text, default="[]")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class RecommendationSnapshot(Base):
+    __tablename__ = "recommendation_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    added_count = Column(Integer, default=0)
+    removed_count = Column(Integer, default=0)
+    maintained_count = Column(Integer, default=0)
+    total_after = Column(Integer, default=0)
+    summary = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)

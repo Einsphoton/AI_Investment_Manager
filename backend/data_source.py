@@ -1,7 +1,9 @@
 from __future__ import annotations
 import json
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from threading import RLock
 from typing import Optional
 from urllib.parse import quote
 
@@ -35,6 +37,55 @@ FUND_PROVIDER_OPTIONS = {
 
 DEFAULT_STOCK_PROVIDERS = {'A': SINA, 'HK': SINA, 'US': YAHOO}
 DEFAULT_FUND_PROVIDERS = {'A': TIANTIAN, 'HK': EASTMONEY, 'US': YAHOO}
+
+_CACHE_MISS = object()
+_CACHE_LOCK = RLock()
+_CACHE: dict[tuple, tuple[float, object]] = {}
+
+
+def _provider_signature(providers: Optional[dict]) -> str:
+    if not providers:
+        return ''
+    try:
+        return json.dumps(providers, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(providers)
+
+
+def _clone_cached_value(value):
+    if isinstance(value, list):
+        return [dict(item) if isinstance(item, dict) else item for item in value]
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _cache_get(key: tuple, ttl: int):
+    now = time.time()
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if not item:
+            return _CACHE_MISS
+        ts, value = item
+        if now - ts > ttl:
+            _CACHE.pop(key, None)
+            return _CACHE_MISS
+        return _clone_cached_value(value)
+
+
+def _cache_set(key: tuple, value):
+    if value is None:
+        with _CACHE_LOCK:
+            _CACHE.pop(key, None)
+        return None
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time(), _clone_cached_value(value))
+        # Keep the process cache bounded; oldest entries are good enough to evict.
+        if len(_CACHE) > 700:
+            oldest = sorted(_CACHE.items(), key=lambda item: item[1][0])[:120]
+            for old_key, _ in oldest:
+                _CACHE.pop(old_key, None)
+    return _clone_cached_value(value)
 
 
 def parse_float(s) -> Optional[float]:
@@ -425,9 +476,14 @@ def lookup_name(code: str, market: str, asset_type: str, providers: Optional[dic
     return None
 
 
-def get_quote(code: str, market: str, asset_type: str, providers: Optional[dict] = None) -> Optional[dict]:
-    is_fund = 'fund' in (asset_type or '')
-    provider = get_provider(asset_type, market, providers)
+def get_quote(code: str, market: str, asset_type: str, providers: Optional[dict] = None, force_refresh: bool = False) -> Optional[dict]:
+    cache_key = ('quote', _base_code(code), market, asset_type or '', _provider_signature(providers))
+    cached = _cache_get(cache_key, 90) if not force_refresh else _CACHE_MISS
+    if cached is not _CACHE_MISS:
+        return cached
+
+    is_fund = (asset_type or '') == 'offshore_fund'
+    provider = get_provider('stock' if (asset_type or '') == 'onshore_fund' else asset_type, market, providers)
 
     result = None
     if is_fund:
@@ -465,7 +521,7 @@ def get_quote(code: str, market: str, asset_type: str, providers: Optional[dict]
                 result = fn(code, market)
                 if result:
                     break
-    return result
+    return _cache_set(cache_key, result)
 
 
 def _eastmoney_kline_secid(code: str, market: str) -> Optional[str]:
@@ -487,8 +543,120 @@ def _eastmoney_quote_secid(code: str, market: str) -> Optional[str]:
     return None
 
 
-def _eastmoney_stock_history(code: str, market: str) -> Optional[list[dict]]:
-    """Fetch ~6 months of daily K-line data from East Money (A-shares)."""
+def _history_limit(period: str) -> int:
+    days = {
+        '1d': 1,
+        '5d': 5,
+        '1m': 31,
+        '3m': 93,
+        '6m': 186,
+        '1y': 370,
+        '2y': 740,
+        '3y': 1110,
+        '5y': 1850,
+        '10y': 3700,
+    }.get(period, 186)
+    return max(5, int(days * 1.55))
+
+
+def _fund_history_target(period: str) -> int:
+    return {
+        '1d': 2,
+        '5d': 8,
+        '1m': 32,
+        '3m': 80,
+        '6m': 160,
+        '1y': 260,
+        '2y': 520,
+        '3y': 780,
+        '5y': 1300,
+        '10y': 2600,
+    }.get(period, 160)
+
+
+def _filter_history_period(history: list[dict], period: str) -> list[dict]:
+    if not history:
+        return []
+    limits = {
+        '1d': 1,
+        '5d': 5,
+        '1m': 31,
+        '3m': 93,
+        '6m': 186,
+        '1y': 366,
+        '2y': 366 * 2,
+        '3y': 366 * 3,
+        '5y': 366 * 5,
+        '10y': 366 * 10,
+    }
+    if period not in limits:
+        return history
+    try:
+        latest = max(datetime.strptime(item['date'][:10], '%Y-%m-%d') for item in history if item.get('date'))
+        cutoff = latest - timedelta(days=limits[period])
+        filtered = [
+            item for item in history
+            if item.get('date') and datetime.strptime(item['date'][:10], '%Y-%m-%d') >= cutoff
+        ]
+        return filtered or history[-limits[period]:]
+    except Exception:
+        return history[-limits[period]:]
+
+
+def _bucket_key(date_value: str, interval: str) -> str:
+    dt = datetime.strptime(date_value[:10], '%Y-%m-%d')
+    if interval == 'week':
+        iso = dt.isocalendar()
+        return f'{iso.year}-W{iso.week:02d}'
+    if interval == 'month':
+        return dt.strftime('%Y-%m')
+    if interval == 'quarter':
+        return f'{dt.year}-Q{((dt.month - 1) // 3) + 1}'
+    if interval == 'year':
+        return str(dt.year)
+    return dt.strftime('%Y-%m-%d')
+
+
+def _aggregate_history(history: list[dict], interval: str) -> list[dict]:
+    if interval not in {'week', 'month', 'quarter', 'year'}:
+        return history
+    buckets: list[dict] = []
+    current_key = ''
+    current: Optional[dict] = None
+    for item in sorted(history, key=lambda x: x.get('date', '')):
+        if not item.get('date') or item.get('price') is None:
+            continue
+        try:
+            key = _bucket_key(item['date'], interval)
+        except Exception:
+            continue
+        open_p = item.get('open', item.get('price'))
+        high = item.get('high', item.get('price'))
+        low = item.get('low', item.get('price'))
+        close = item.get('price')
+        if key != current_key:
+            if current:
+                buckets.append(current)
+            current_key = key
+            current = {
+                'date': item['date'][:10],
+                'price': close,
+                'open': open_p,
+                'high': high,
+                'low': low,
+            }
+        elif current:
+            current['date'] = item['date'][:10]
+            current['price'] = close
+            current['high'] = max(current.get('high', high), high)
+            current['low'] = min(current.get('low', low), low)
+    if current:
+        buckets.append(current)
+    return buckets
+
+
+def _eastmoney_stock_history(code: str, market: str, period: str = '6m') -> Optional[list[dict]]:
+    """Fetch daily K-line data from East Money."""
     secid = _eastmoney_kline_secid(code, market)
     if not secid:
         return None
@@ -496,7 +664,7 @@ def _eastmoney_stock_history(code: str, market: str) -> Optional[list[dict]]:
         resp = requests.get(
             'https://push2.eastmoney.com/api/qt/stock/kline/get',
             params={'secid': secid, 'fields1': 'f1,f2,f3', 'fields2': 'f51,f52,f53,f54,f55',
-                    'klt': '101', 'fqt': '1', 'end': '20500101', 'lmt': '120'},
+                    'klt': '101', 'fqt': '1', 'end': '20500101', 'lmt': str(_history_limit(period))},
             headers={'User-Agent': 'Mozilla/5.0'}, timeout=10,
         )
         data = resp.json().get('data', {})
@@ -520,7 +688,7 @@ def _eastmoney_stock_history(code: str, market: str) -> Optional[list[dict]]:
         return None
 
 
-def _eastmoney_fund_history(code: str) -> Optional[list[dict]]:
+def _eastmoney_fund_history(code: str, period: str = '6m') -> Optional[list[dict]]:
     """Fetch fund NAV history from East Money."""
     code = _base_code(code)
     try:
@@ -528,34 +696,53 @@ def _eastmoney_fund_history(code: str) -> Optional[list[dict]]:
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
             'Referer': 'https://fund.eastmoney.com/',
         }
-        resp = requests.get(
-            'https://api.fund.eastmoney.com/f10/lsjz',
-            params={'fundCode': code, 'pageIndex': 1, 'pageSize': 120},
-            headers=headers, timeout=10,
-        )
-        data = resp.json()
-        lsjz = data.get('Data', {}).get('LSJZList', [])
         history = []
-        for item in lsjz:
-            nav = parse_float(item.get('DWJZ'))
-            date_str = item.get('FSRQ', '')
-            if nav is not None and date_str:
-                history.append({'date': date_str, 'price': round(nav, 4)})
+        page_size = 120
+        target = _fund_history_target(period)
+        max_pages = max(1, min(140, (target + page_size - 1) // page_size))
+        for page_index in range(1, max_pages + 1):
+            try:
+                resp = requests.get(
+                    'https://api.fund.eastmoney.com/f10/lsjz',
+                    params={'fundCode': code, 'pageIndex': page_index, 'pageSize': page_size},
+                    headers=headers, timeout=4,
+                )
+                data = resp.json()
+            except Exception:
+                if page_index == 1:
+                    raise
+                break
+            lsjz = data.get('Data', {}).get('LSJZList', [])
+            if not lsjz:
+                break
+            for item in lsjz:
+                nav = parse_float(item.get('DWJZ'))
+                date_str = item.get('FSRQ', '')
+                if nav is not None and date_str:
+                    history.append({'date': date_str, 'price': round(nav, 4)})
+            if len(history) >= target:
+                break
         return history if history else None
     except Exception as e:
         print(f"[EastMoney Fund History] {code}: {e}")
         return None
 
 
-def _yahoo_history(code: str, market: str) -> Optional[list[dict]]:
+def _yahoo_history(code: str, market: str, period: str = '6m', interval: str = 'day') -> Optional[list[dict]]:
     """Fetch history from Yahoo Finance (HK/US stocks, fallback)."""
     try:
         yahoo_code = _yahoo_code(code, market)
 
+        yahoo_range = period if period in {'1d', '5d', '1m', '3m', '6m', '1y', '2y', '3y', '5y', '10y'} else '6mo'
+        yahoo_interval = '5m' if interval == 'intraday' and period in {'1d', '5d'} else '1d'
+        if yahoo_range == '10y':
+            yahoo_range = '10y'
+        if yahoo_range.endswith('m'):
+            yahoo_range = yahoo_range.replace('m', 'mo')
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
         resp = requests.get(
             f'https://query1.finance.yahoo.com/v8/finance/chart/{quote(yahoo_code)}',
-            params={'range': '6mo', 'interval': '1d'},
+            params={'range': yahoo_range, 'interval': yahoo_interval},
             headers=headers, timeout=10,
         )
         data = resp.json()
@@ -572,7 +759,7 @@ def _yahoo_history(code: str, market: str) -> Optional[list[dict]]:
             close = closes[i] if i < len(closes) else None
             if close is not None:
                 item = {
-                    'date': datetime.fromtimestamp(ts).strftime('%Y-%m-%d'),
+                    'date': datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M') if yahoo_interval != '1d' else datetime.fromtimestamp(ts).strftime('%Y-%m-%d'),
                     'price': round(float(close), 3),
                 }
                 if i < len(opens) and opens[i] is not None:
@@ -588,7 +775,7 @@ def _yahoo_history(code: str, market: str) -> Optional[list[dict]]:
         return None
 
 
-def _tencent_stock_history(code: str, market: str) -> Optional[list[dict]]:
+def _tencent_stock_history(code: str, market: str, period: str = '6m') -> Optional[list[dict]]:
     """Fetch K-line history Tencent finance (A-shares / HK)."""
     code = _local_code(code, market)
     if market == 'A':
@@ -599,7 +786,7 @@ def _tencent_stock_history(code: str, market: str) -> Optional[list[dict]]:
         return None
     try:
         resp = requests.get(
-            f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{code},day,,,120,qfq',
+            f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{code},day,,,{_history_limit(period)},qfq',
             headers={'User-Agent': 'Mozilla/5.0'}, timeout=10,
         )
         data = resp.json()
@@ -620,35 +807,56 @@ def _tencent_stock_history(code: str, market: str) -> Optional[list[dict]]:
         return None
 
 
-def get_history(code: str, market: str, asset_type: str, providers: Optional[dict] = None) -> Optional[list[dict]]:
-    """Fetch ~6 months of daily K-line / NAV history.
+def get_history(code: str, market: str, asset_type: str, providers: Optional[dict] = None, period: str = '6m', interval: str = 'day', force_refresh: bool = False) -> Optional[list[dict]]:
+    """Fetch K-line / NAV history.
 
     Multi-source fallback chain: tries each source in order,
     returns the first one that returns data.
     """
-    is_fund = 'fund' in (asset_type or '')
+    cache_key = ('history', _base_code(code), market, asset_type or '', _provider_signature(providers), period, interval)
+    cached = _cache_get(cache_key, 20 * 60) if not force_refresh else _CACHE_MISS
+    if cached is not _CACHE_MISS:
+        return cached
+
+    full_day_key = ('history-full-day', _base_code(code), market, asset_type or '', _provider_signature(providers))
+    if interval != 'intraday' and not force_refresh:
+        full_day = _cache_get(full_day_key, 20 * 60)
+        if full_day is not _CACHE_MISS:
+            result = _aggregate_history(_filter_history_period(full_day or [], period), interval)
+            return _cache_set(cache_key, result)
+
+    is_fund = (asset_type or '') == 'offshore_fund'
     provider = get_provider(asset_type, market, providers)
 
     if is_fund:
         sources = []
         if provider == TENCENT:
-            sources.append(lambda: _tencent_stock_history(code, market))
+            sources.append(lambda: _tencent_stock_history(code, market, period))
         sources.extend([
-            lambda: _eastmoney_fund_history(code),
-            lambda: _yahoo_history(code, market),
+            lambda: _eastmoney_fund_history(code, period),
+            lambda: _yahoo_history(code, market, period, interval),
         ])
         for fn in sources:
             result = fn()
             if result:
-                return result
-        return None
+                if period == '10y' and interval != 'intraday':
+                    _cache_set(full_day_key, result)
+                result = _filter_history_period(result, period)
+                return _cache_set(cache_key, _aggregate_history(result, interval))
+        if period == '10y' and interval != 'intraday':
+            for fallback_period in ['5y', '3y', '1y', '6m']:
+                fallback = get_history(code, market, asset_type, providers, fallback_period, 'day', force_refresh)
+                if fallback:
+                    _cache_set(full_day_key, fallback)
+                    return _cache_set(cache_key, _aggregate_history(fallback, interval))
+        return _cache_set(cache_key, None)
 
     def em_s():
-        return _eastmoney_stock_history(code, market)
+        return _eastmoney_stock_history(code, market, period)
     def yh():
-        return _yahoo_history(code, market)
+        return _yahoo_history(code, market, period, interval)
     def tencent_h():
-        return _tencent_stock_history(code, market)
+        return _tencent_stock_history(code, market, period)
 
     if market == 'A':
         ordered = [tencent_h, em_s, yh]
@@ -658,15 +866,26 @@ def get_history(code: str, market: str, asset_type: str, providers: Optional[dic
         ordered = [tencent_h, yh, em_s]
     else:
         ordered = [yh, em_s, tencent_h]
+    if interval == 'intraday':
+        ordered = [yh, tencent_h, em_s]
 
     for fn in ordered:
         try:
             result = fn()
             if result:
-                return result
+                if period == '10y' and interval != 'intraday':
+                    _cache_set(full_day_key, result)
+                result = _filter_history_period(result, period)
+                return _cache_set(cache_key, _aggregate_history(result, interval))
         except Exception:
             continue
-    return None
+    if period == '10y' and interval != 'intraday':
+        for fallback_period in ['5y', '3y', '1y', '6m']:
+            fallback = get_history(code, market, asset_type, providers, fallback_period, 'day', force_refresh)
+            if fallback:
+                _cache_set(full_day_key, fallback)
+                return _cache_set(cache_key, _aggregate_history(fallback, interval))
+    return _cache_set(cache_key, None)
 
 
 def _sina_stock_fundamentals(code: str, market: str) -> Optional[dict]:
@@ -1000,7 +1219,7 @@ def _yahoo_fundamentals(code: str, market: str) -> Optional[dict]:
         return None
 
 
-def get_fundamentals(code: str, market: str, asset_type: str, providers: Optional[dict] = None) -> Optional[dict]:
+def get_fundamentals(code: str, market: str, asset_type: str, providers: Optional[dict] = None, force_refresh: bool = False) -> Optional[dict]:
     """Fetch fundamental metrics (PE, PB, dividend, market cap, etc.).
 
     Multi-source fallback chain (all sources tried, results merged):
@@ -1009,20 +1228,25 @@ def get_fundamentals(code: str, market: str, asset_type: str, providers: Optiona
       3. Yahoo (best coverage for HK / US)
       4. Sina / Tencent (backup extractors)
     """
+    cache_key = ('fundamentals', _base_code(code), market, asset_type or '', _provider_signature(providers))
+    cached = _cache_get(cache_key, 60 * 60) if not force_refresh else _CACHE_MISS
+    if cached is not _CACHE_MISS:
+        return cached
+
     base = _base_code(code)
-    is_fund = 'fund' in (asset_type or '') or (market == 'A' and base.startswith(('1', '5')))
+    is_fund = (asset_type or '') == 'offshore_fund'
     provider = get_provider(asset_type, market, providers)
 
     if is_fund:
         result = _complete_fundamentals(code, market, asset_type, _eastmoney_fund_fundamentals(code), providers)
         if result:
-            return result
+            return _cache_set(cache_key, result)
         if market == 'A':
             stock_like = _complete_fundamentals(code, market, asset_type, _eastmoney_stock_fundamentals(code, market), providers)
             if stock_like:
                 safe_keys = {'market_cap', 'dividend_yield', 'shares_outstanding'}
-                return {k: v for k, v in stock_like.items() if k in safe_keys}
-        return result
+                return _cache_set(cache_key, {k: v for k, v in stock_like.items() if k in safe_keys})
+        return _cache_set(cache_key, result)
 
     def em():
         return _eastmoney_stock_fundamentals(code, market)
@@ -1033,9 +1257,12 @@ def get_fundamentals(code: str, market: str, asset_type: str, providers: Optiona
     def tencent():
         return _tencent_stock_fundamentals(code, market)
 
+    if (asset_type or '') == 'onshore_fund':
+        return _cache_set(cache_key, {})
+
     if market == 'A':
         provider_first = {YAHOO: yahoo}.get(provider)
-        ordered = [provider_first, tencent, em, yahoo, sina] if provider_first else [tencent, em, yahoo, sina]
+        ordered = [provider_first, tencent, em, sina] if provider_first else [tencent, em, sina]
     elif market == 'HK':
         provider_first = {YAHOO: yahoo, SINA: tencent}.get(provider)
         ordered = [provider_first, tencent, yahoo, em] if provider_first else [tencent, yahoo, em]
@@ -1057,7 +1284,7 @@ def get_fundamentals(code: str, market: str, asset_type: str, providers: Optiona
                 if k not in all_data and v is not None:
                     all_data[k] = v
 
-    return _complete_fundamentals(code, market, asset_type, all_data, providers)
+    return _cache_set(cache_key, _complete_fundamentals(code, market, asset_type, all_data, providers))
 
 
 def search(keyword: str, market: str, asset_type: str) -> list[dict]:

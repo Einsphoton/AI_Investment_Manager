@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import json
 import hashlib
+import re
 from openai import OpenAI
 from fastapi import HTTPException
 from models import Asset, Settings, AnalysisRecord
@@ -35,12 +38,47 @@ def safe_key_fingerprint(api_key: str) -> dict:
 def openai_runtime_summary(api_key: str, base_url: str, model: str) -> str:
     fp = safe_key_fingerprint(api_key)
     key_label = f"{fp['prefix']}...{fp['suffix']} len={fp['length']} sha12={fp['sha12']}" if fp["length"] else "未配置"
-    return f"base_url={base_url or 'https://api.openai.com/v1'}, model={model}, key={key_label}"
+    return f"base_url={normalize_openai_base_url(base_url) or 'https://api.openai.com/v1'}, model={model}, key={key_label}"
+
+
+def normalize_openai_base_url(base_url: str | None) -> str | None:
+    """Normalize user-entered OpenAI-compatible API roots.
+
+    The OpenAI SDK expects a base API root, not the full chat/completions path.
+    In deployments it is easy to copy a provider URL with an endpoint suffix,
+    which commonly turns into a confusing 404 during analysis.
+    """
+    url = (base_url or "").strip()
+    if not url:
+        return None
+
+    url = url.rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/responses", "/models"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)].rstrip("/")
+            break
+
+    if "api.openai.com" in url and not re.search(r"/v\d+$", url):
+        url = f"{url}/v1"
+
+    return url
+
+
+def openai_error_detail(exc: Exception, runtime_summary: str) -> str:
+    message = str(exc)
+    hint = ""
+    if "404" in message or "Not Found" in message:
+        hint = (
+            "；提示：404 通常表示 Base URL 或模型名不匹配。请在设置页确认 Base URL 是服务商的 "
+            "OpenAI 兼容 API 根路径，例如 https://api.openai.com/v1，而不是网页地址或完整的 "
+            "/chat/completions 路径"
+        )
+    return f"{message}{hint}；当前使用配置：{runtime_summary}"
 
 
 def run_ai_analysis(db: Session) -> AnalysisRecord:
     api_key = get_setting(db, "openai_api_key")
-    base_url = get_setting(db, "openai_base_url")
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
@@ -122,7 +160,7 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
         detail = result.get("detail", "")
     except Exception as e:
         runtime = openai_runtime_summary(api_key, base_url, model)
-        raise HTTPException(status_code=502, detail=f"AI 分析失败: {str(e)}；当前使用配置：{runtime}")
+        raise HTTPException(status_code=502, detail=f"AI 分析失败: {openai_error_detail(e, runtime)}")
 
     record = AnalysisRecord(
         summary=summary, detail=detail,

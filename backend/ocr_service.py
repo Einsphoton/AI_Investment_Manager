@@ -69,7 +69,7 @@ IMAGE_EXTENSIONS = {
 
 
 def _get_llm_config(db_session) -> dict:
-    from ai_service import get_setting
+    from ai_service import get_setting, normalize_openai_base_url
 
     use_same = get_setting(db_session, "ocr_use_same_as_ai") != "false"
     if use_same:
@@ -84,7 +84,7 @@ def _get_llm_config(db_session) -> dict:
             db_session, "openai_base_url"
         )
         model = get_setting(db_session, "ocr_model") or "gpt-4o-mini"
-    return {"api_key": api_key, "base_url": base_url, "model": model}
+    return {"api_key": api_key, "base_url": normalize_openai_base_url(base_url) or "", "model": model}
 
 
 def _build_messages(data_url: str, filename: str, use_detail: bool) -> list[dict[str, Any]]:

@@ -13,10 +13,12 @@ from openai import OpenAI
 from models import Asset, Target, AnalysisRecord
 from agent.personality import build_system_prompt
 
+SSE_PADDING = ":" + (" " * 4096) + "\n"
+
 
 def sse_event(event_type: str, data: dict) -> str:
     """Format an SSE event string."""
-    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return f"{SSE_PADDING}event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _yield(fn):
@@ -41,13 +43,14 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
         yield sse_event("error", {"detail": "请先配置 OpenAI API Key"})
         return
 
-    base_url = get_setting(db, "openai_base_url")
+    from ai_service import normalize_openai_base_url
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
-    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=90)
-    from ai_service import openai_runtime_summary
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
+    from ai_service import openai_error_detail, openai_runtime_summary
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
 
     # Stage 1: Load assets (slow start)
@@ -196,7 +199,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
 
     except Exception as e:
         import traceback
-        yield sse_event("error", {"detail": f"AI 分析失败: {str(e)}；当前使用配置：{runtime_summary}"})
+        yield sse_event("error", {"detail": f"AI 分析失败: {openai_error_detail(e, runtime_summary)}"})
         yield sse_event("log", {"message": f"❌ 分析出错: {str(e)}", "tag": "AI"})
 
 
@@ -207,12 +210,15 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
         yield sse_event("error", {"detail": "请先配置 OpenAI API Key"})
         return
 
-    base_url = get_setting(db, "openai_base_url")
+    from ai_service import normalize_openai_base_url
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
-    client = OpenAI(api_key=api_key, base_url=base_url or None)
+    from ai_service import openai_error_detail, openai_runtime_summary
+    runtime_summary = openai_runtime_summary(api_key, base_url, model)
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
 
     yield sse_event("log", {"message": "正在加载标的列表...", "tag": "标的"})
     targets = db.query(Target).filter(Target.status == "active").all()
@@ -333,7 +339,7 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
         yield sse_event("complete", result)
 
     except Exception as e:
-        yield sse_event("error", {"detail": f"标的分析失败: {str(e)}"})
+        yield sse_event("error", {"detail": f"标的分析失败: {openai_error_detail(e, runtime_summary)}"})
 
 
 def stream_investment_advice(db: Session) -> Generator[str, None, None]:
@@ -343,7 +349,8 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         yield sse_event("error", {"detail": "请先配置 OpenAI API Key"})
         return
 
-    base_url = get_setting(db, "openai_base_url")
+    from ai_service import normalize_openai_base_url
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
@@ -381,7 +388,9 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
     yield sse_event("thinking", {"message": "AI 正在分析投资策略..."})
     yield sse_event("progress", {"progress": 25})
 
-    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=120)
+    from ai_service import openai_error_detail, openai_runtime_summary
+    runtime_summary = openai_runtime_summary(api_key, base_url, model)
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     prompt, market_snapshot = _build_investment_advice_prompt(
         system_prompt,
         budget_status,
@@ -441,7 +450,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         yield sse_event("complete", result)
 
     except Exception as e:
-        yield sse_event("error", {"detail": f"投资建议生成失败: {str(e)}"})
+        yield sse_event("error", {"detail": f"投资建议生成失败: {openai_error_detail(e, runtime_summary)}"})
 
 
 from datetime import datetime

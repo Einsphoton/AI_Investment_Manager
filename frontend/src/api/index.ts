@@ -4,6 +4,21 @@ const api = axios.create({
   baseURL: '/api',
 })
 
+api.interceptors.response.use(
+  response => response,
+  error => {
+    const detail = error?.response?.data?.detail
+    if (detail) {
+      error.message = detail
+    } else if (error?.response?.status === 404) {
+      const method = (error?.config?.method || 'request').toUpperCase()
+      const url = `${error?.config?.baseURL || ''}${error?.config?.url || ''}`
+      error.message = `${method} ${url} 返回 404，请检查访问路径、反向代理或 API Base URL 配置`
+    }
+    return Promise.reject(error)
+  },
+)
+
 const CACHE_MISS = Symbol('cache-miss')
 const responseCache = new Map<string, { expires: number; value: any }>()
 const requestCache = new Map<string, Promise<any>>()

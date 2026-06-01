@@ -2,7 +2,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, time as datetime_time, timedelta
 from typing import Optional
@@ -36,7 +38,13 @@ from schemas import (
     MarketFundamentalsRequest, MarketFundamentalsResponse,
     OcrParseResponse, OcrAssetItem, AssetsBatchCreate,
 )
-from ai_service import run_ai_analysis, get_setting, set_setting, safe_key_fingerprint
+from ai_service import (
+    run_ai_analysis,
+    get_setting,
+    set_setting,
+    safe_key_fingerprint,
+    normalize_openai_base_url,
+)
 from data_source import lookup_name, get_quote, get_history, get_fundamentals, search, PROVIDER_LABELS, STOCK_PROVIDER_OPTIONS, FUND_PROVIDER_OPTIONS
 from ocr_service import parse_image
 from agent import AgentHarness
@@ -93,7 +101,7 @@ def scheduled_analysis():
 def _run_scheduled_target_analysis(db: Session):
     try:
         api_key = get_setting(db, "openai_api_key")
-        base_url = get_setting(db, "openai_base_url")
+        base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
         model = get_setting(db, "openai_model") or "gpt-4o-mini"
         personality = get_setting(db, "ai_personality") or "balanced"
         report_style = get_setting(db, "ai_report_style") or "professional"
@@ -317,6 +325,95 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+    "Content-Encoding": "identity",
+}
+
+_stream_jobs: dict[str, dict] = {}
+_stream_jobs_lock = threading.Lock()
+
+
+def _parse_sse_message(message: str) -> tuple[str, dict] | None:
+    event_type = ""
+    data = None
+    for raw_line in message.splitlines():
+        line = raw_line.strip()
+        if line.startswith("event:"):
+            event_type = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            try:
+                data = json.loads(line.split(":", 1)[1].strip())
+            except json.JSONDecodeError:
+                data = {"message": line.split(":", 1)[1].strip()}
+    if event_type and data is not None:
+        return event_type, data
+    return None
+
+
+def _append_stream_job_event(job_id: str, event_type: str, data: dict) -> None:
+    with _stream_jobs_lock:
+        job = _stream_jobs.get(job_id)
+        if not job:
+            return
+        next_id = len(job["events"])
+        job["events"].append({"id": next_id, "type": event_type, "data": data})
+        job["updated_at"] = time.time()
+        if event_type in {"complete", "error"}:
+            job["done"] = True
+            if event_type == "error":
+                job["error"] = data.get("detail") or data.get("message") or "任务失败"
+
+
+def _cleanup_stream_jobs() -> None:
+    cutoff = time.time() - 3600
+    with _stream_jobs_lock:
+        stale_ids = [
+            job_id for job_id, job in _stream_jobs.items()
+            if job.get("updated_at", job.get("created_at", 0)) < cutoff
+        ]
+        for job_id in stale_ids:
+            _stream_jobs.pop(job_id, None)
+
+
+def _run_stream_job(job_id: str, url: str) -> None:
+    db = SessionLocal()
+    try:
+        if url == "/api/analysis/run-stream":
+            generator = stream_portfolio_analysis(db)
+        elif url == "/api/targets/ai-analyze-stream":
+            generator = stream_target_analysis(db)
+        elif url == "/api/investment-advice/run-stream":
+            generator = stream_investment_advice(db)
+        else:
+            _append_stream_job_event(job_id, "error", {"detail": f"不支持的流式任务: {url}"})
+            return
+
+        saw_terminal = False
+        for message in generator:
+            parsed = _parse_sse_message(message)
+            if not parsed:
+                continue
+            event_type, data = parsed
+            _append_stream_job_event(job_id, event_type, data)
+            if event_type in {"complete", "error"}:
+                saw_terminal = True
+                break
+        if not saw_terminal:
+            _append_stream_job_event(job_id, "complete", {})
+    except Exception as exc:
+        _append_stream_job_event(job_id, "error", {"detail": f"后台分析任务失败: {exc}"})
+    finally:
+        db.close()
+        with _stream_jobs_lock:
+            job = _stream_jobs.get(job_id)
+            if job:
+                job["done"] = True
+                job["updated_at"] = time.time()
 
 
 def _is_failed_analysis_record(record: AnalysisRecord | None) -> bool:
@@ -582,6 +679,7 @@ def _run_compact_asset_ai_analysis(
     fundamentals_map: dict,
     history_map: dict,
 ) -> dict:
+    base_url = normalize_openai_base_url(base_url)
     ctx = SkillContext(
         api_key=api_key,
         base_url=base_url,
@@ -1494,11 +1592,7 @@ def stream_analysis(db: Session = Depends(get_db)):
     return StreamingResponse(
         stream_portfolio_analysis(db),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )
 
 
@@ -1515,7 +1609,53 @@ def stream_analysis_mock():
         yield sse_event("complete", {"summary": "模拟完成", "detail": "这是模拟数据"})
     from fastapi.responses import StreamingResponse
     return StreamingResponse(mock_events(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        headers=SSE_HEADERS)
+
+
+@app.post("/api/stream-jobs")
+def create_stream_job(payload: dict):
+    """Start an AI stream operation in the background for proxy-safe polling."""
+    url = str((payload or {}).get("url") or "")
+    supported = {
+        "/api/analysis/run-stream",
+        "/api/targets/ai-analyze-stream",
+        "/api/investment-advice/run-stream",
+    }
+    if url not in supported:
+        raise HTTPException(status_code=400, detail=f"不支持的流式任务: {url}")
+
+    _cleanup_stream_jobs()
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with _stream_jobs_lock:
+        _stream_jobs[job_id] = {
+            "id": job_id,
+            "url": url,
+            "created_at": now,
+            "updated_at": now,
+            "events": [],
+            "done": False,
+            "error": None,
+        }
+
+    worker = threading.Thread(target=_run_stream_job, args=(job_id, url), daemon=True)
+    worker.start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/stream-jobs/{job_id}")
+def get_stream_job(job_id: str, after: int = Query(-1)):
+    with _stream_jobs_lock:
+        job = _stream_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="后台任务不存在或已过期")
+        events = [event for event in job["events"] if int(event["id"]) > after]
+        return {
+            "job_id": job_id,
+            "events": events,
+            "done": bool(job.get("done")),
+            "error": job.get("error"),
+        }
 
 
 @app.get("/api/analysis/latest", response_model=AnalysisResponse)
@@ -1581,7 +1721,8 @@ class CheckModelsBody(PydanticBaseModel):
 def check_models(body: CheckModelsBody, db: Session = Depends(get_db)):
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=body.api_key, base_url=body.base_url or None)
+        base_url = normalize_openai_base_url(body.base_url)
+        client = OpenAI(api_key=body.api_key, base_url=base_url or None)
         models = client.models.list()
         ids = sorted({
             model_id for model_id in (getattr(m, "id", "") for m in models)
@@ -1599,7 +1740,7 @@ def get_ai_runtime_config(db: Session = Depends(get_db)):
     return {
         "analysis": {
             "api_key": safe_key_fingerprint(ai_key),
-            "base_url": get_setting(db, "openai_base_url") or "https://api.openai.com/v1",
+            "base_url": normalize_openai_base_url(get_setting(db, "openai_base_url")) or "https://api.openai.com/v1",
             "model": get_setting(db, "openai_model") or "gpt-4o-mini",
         },
         "ocr": {
@@ -1907,7 +2048,7 @@ def ai_analyze_targets_stream(db: Session = Depends(get_db)):
     return StreamingResponse(
         stream_target_analysis(db),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -1925,7 +2066,7 @@ def advice_run_stream(db: Session = Depends(get_db)):
     return StreamingResponse(
         stream_investment_advice(db),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -1933,7 +2074,7 @@ def advice_run_stream(db: Session = Depends(get_db)):
 def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = Depends(get_db)):
     try:
         api_key = get_setting(db, "openai_api_key")
-        base_url = get_setting(db, "openai_base_url")
+        base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
         model = get_setting(db, "openai_model") or "gpt-4o-mini"
 
         if not api_key:
@@ -2157,7 +2298,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
 @app.post("/api/analysis/agent-run", response_model=AgentAnalysisResponse)
 def agent_analysis_run(req: AgentAnalysisRequest, db: Session = Depends(get_db)):
     api_key = get_setting(db, "openai_api_key")
-    base_url = get_setting(db, "openai_base_url")
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
 
     if not api_key:
@@ -2284,7 +2425,7 @@ def agent_analysis_run(req: AgentAnalysisRequest, db: Session = Depends(get_db))
 @app.post("/api/investment-advice/run", response_model=InvestmentAdviceResponse)
 def run_investment_advice(db: Session = Depends(get_db)):
     api_key = get_setting(db, "openai_api_key")
-    base_url = get_setting(db, "openai_base_url")
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     if not api_key:
         raise HTTPException(status_code=400, detail="请先在设置页面配置 OpenAI API Key")
@@ -2536,7 +2677,7 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
     }
     ai_config = {
         "model": get_setting(db, "openai_model") or "gpt-4o-mini",
-        "base_url": get_setting(db, "openai_base_url") or "https://api.openai.com/v1",
+        "base_url": normalize_openai_base_url(get_setting(db, "openai_base_url")) or "https://api.openai.com/v1",
         "personality": get_setting(db, "ai_personality") or "balanced",
         "report_style": get_setting(db, "ai_report_style") or "professional",
     }
@@ -2590,7 +2731,7 @@ def get_ai_chat_context(db: Session = Depends(get_db)):
 @app.post("/api/chat", response_model=AIChatResponse)
 def run_ai_chat(req: AIChatRequest, db: Session = Depends(get_db)):
     api_key = get_setting(db, "openai_api_key")
-    base_url = get_setting(db, "openai_base_url")
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"

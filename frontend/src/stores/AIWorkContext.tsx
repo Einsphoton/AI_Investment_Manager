@@ -135,6 +135,11 @@ interface AIWorkContextValue {
 }
 
 const AIWorkContext = createContext<AIWorkContextValue | null>(null)
+const POLLED_STREAM_URLS = new Set([
+  '/api/analysis/run-stream',
+  '/api/targets/ai-analyze-stream',
+  '/api/investment-advice/run-stream',
+])
 
 export function AIWorkProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(aiWorkReducer, initialState)
@@ -168,10 +173,11 @@ export function AIWorkProvider({ children }: { children: React.ReactNode }) {
       return () => { clearTimeout(t); timeoutSetRef.current.delete(t) }
     }
 
-    // Global timeout: if running for more than 180s, force-complete
+    // Global timeout: NAS deployments can be slow when market data and AI calls run together.
+    // Keep a guardrail, but do not fail legitimate long analyses after only a few minutes.
     if (state.startTime) {
       const elapsed = Date.now() - state.startTime
-      if (elapsed > 180000 && !state.error) {
+      if (elapsed > 900000 && !state.error) {
         dispatch({ type: 'ADD_LOG', entry: { timestamp: new Date(), message: '⏰ 任务超时，自动结束', type: 'info' } })
         dispatch({ type: 'SET_ERROR', error: '任务运行时间过长，已自动结束' })
       }
@@ -351,12 +357,106 @@ export function AIWorkProvider({ children }: { children: React.ReactNode }) {
     if (!signal.aborted) {
       safetyTimer = setTimeout(() => {
         controller.abort()
-      }, 120000)
+      }, 900000)
+    }
+
+    if (POLLED_STREAM_URLS.has(url)) {
+      try {
+        const started = await fetch('/api/stream-jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, body }),
+          signal,
+        })
+        if (!started.ok) {
+          const errText = await started.text().catch(() => '')
+          throw new Error(errText || `${started.status} ${started.statusText}`)
+        }
+        const { job_id: jobId } = await started.json()
+        let after = -1
+        let completed = false
+
+        while (!completed) {
+          if (signal.aborted) {
+            const cancelErr = new Error('分析已取消')
+            ;(cancelErr as any).isCancelled = true
+            throw cancelErr
+          }
+
+          const polled = await fetch(`/api/stream-jobs/${jobId}?after=${after}`, {
+            headers: { 'Cache-Control': 'no-cache' },
+            signal,
+          })
+          if (!polled.ok) {
+            const errText = await polled.text().catch(() => '')
+            throw new Error(errText || `${polled.status} ${polled.statusText}`)
+          }
+          const payload = await polled.json()
+          for (const event of payload.events || []) {
+            after = Math.max(after, Number(event.id))
+            const data = event.data || {}
+            switch (event.type) {
+              case 'progress':
+                if (data.progress !== undefined) {
+                  dispatch({ type: 'SET_PROGRESS', progress: data.progress })
+                }
+                break
+              case 'thinking':
+                if (data.message) {
+                  dispatch({ type: 'SET_THINKING', message: data.message })
+                }
+                break
+              case 'log':
+                if (data.message) {
+                  dispatch({
+                    type: 'ADD_LOG',
+                    entry: {
+                      timestamp: new Date(),
+                      message: data.message,
+                      type: data.message.startsWith('✅') ? 'success' : 'info',
+                      tag: data.tag || undefined,
+                    },
+                  })
+                }
+                break
+              case 'complete':
+                if (safetyTimer) clearTimeout(safetyTimer)
+                dispatch({ type: 'SET_PROGRESS', progress: 100 })
+                return data
+              case 'error':
+                if (safetyTimer) clearTimeout(safetyTimer)
+                throw new Error(data.detail || '分析失败')
+            }
+          }
+
+          if (payload.done) {
+            completed = true
+            if (payload.error) throw new Error(payload.error)
+            if (safetyTimer) clearTimeout(safetyTimer)
+            return {}
+          }
+          await new Promise(resolve => setTimeout(resolve, 800))
+        }
+        if (safetyTimer) clearTimeout(safetyTimer)
+        return {}
+      } catch (e: any) {
+        if (safetyTimer) clearTimeout(safetyTimer)
+        if (e.name === 'AbortError' || e.type === 'aborted') {
+          const cancelErr = new Error('分析已取消')
+          ;(cancelErr as any).isCancelled = true
+          throw cancelErr
+        }
+        throw e
+      }
     }
 
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Accept': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Content-Type': 'application/json',
+      },
       body: body ? JSON.stringify(body) : undefined,
       signal,
     }).catch((e: any) => {
@@ -372,7 +472,14 @@ export function AIWorkProvider({ children }: { children: React.ReactNode }) {
 
     if (!response.ok) {
       const errText = await response.text().catch(() => 'Unknown error')
-      throw new Error(errText)
+      let detail = errText
+      try {
+        const parsed = JSON.parse(errText)
+        detail = parsed?.detail || parsed?.message || errText
+      } catch {
+        detail = errText
+      }
+      throw new Error(detail || `${response.status} ${response.statusText}`)
     }
 
     const reader = response.body!.getReader()

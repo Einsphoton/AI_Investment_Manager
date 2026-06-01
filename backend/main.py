@@ -2545,6 +2545,60 @@ def _chat_group_sum(items: list[dict], key: str, value_key: str = "market_value"
     ]
 
 
+def _chat_asset_valuation(item: dict) -> dict:
+    shares = _normalize_ai_number(item.get("shares"), 0)
+    buy_price = _normalize_ai_number(item.get("buy_price"), 0)
+    current_price = _normalize_ai_number(_quote_value(item, "current_price"), buy_price)
+    total_cost = shares * buy_price
+    market_value = shares * current_price
+    total_pnl = market_value - total_cost
+    return {
+        "current_price": current_price,
+        "total_cost": total_cost,
+        "market_value": market_value,
+        "total_pnl": total_pnl,
+        "total_pnl_percent": (total_pnl / total_cost * 100) if total_cost else 0,
+    }
+
+
+def _hydrate_ai_chat_asset_valuations(asset_items: list[dict]) -> list[dict]:
+    return [
+        {
+            **item,
+            **_chat_asset_valuation(item),
+        }
+        for item in asset_items
+    ]
+
+
+def _chat_pnl_by_asset(asset_items: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for item in asset_items:
+        code = _analysis_code_key(str(item.get("code") or ""))
+        group_key = f"{item.get('market') or ''}:{item.get('asset_type') or ''}:{code or item.get('id')}"
+        if group_key not in grouped:
+            grouped[group_key] = {
+                "name": item.get("name") or item.get("code"),
+                "code": item.get("code"),
+                "total_cost": 0.0,
+                "market_value": 0.0,
+                "value": 0.0,
+            }
+        row = grouped[group_key]
+        row["total_cost"] += _normalize_ai_number(item.get("total_cost"), 0)
+        row["market_value"] += _normalize_ai_number(item.get("market_value"), 0)
+        row["value"] += _normalize_ai_number(item.get("total_pnl"), 0)
+
+    rows = []
+    for row in grouped.values():
+        total_cost = row.pop("total_cost", 0)
+        row.pop("market_value", None)
+        row["value"] = round(row["value"], 2)
+        row["pnl_percent"] = round((row["value"] / total_cost * 100) if total_cost else 0, 2)
+        rows.append(row)
+    return sorted(rows, key=lambda row: abs(row["value"]), reverse=True)[:8]
+
+
 def _build_ai_chat_visual_data(asset_items: list[dict], target_items: list[dict], budget_status: list[dict], portfolio: dict) -> dict:
     allocation_by_market = []
     for item in _chat_group_sum(asset_items, "market"):
@@ -2560,15 +2614,7 @@ def _build_ai_chat_visual_data(asset_items: list[dict], target_items: list[dict]
             "label": _asset_type_label(item["name"]),
         })
 
-    pnl_by_asset = sorted([
-        {
-            "name": item.get("name") or item.get("code"),
-            "code": item.get("code"),
-            "value": round(_normalize_ai_number(item.get("total_pnl"), 0), 2),
-            "pnl_percent": round(_normalize_ai_number(item.get("total_pnl_percent"), 0), 2),
-        }
-        for item in asset_items
-    ], key=lambda row: abs(row["value"]), reverse=True)[:8]
+    pnl_by_asset = _chat_pnl_by_asset(asset_items)
 
     priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     targets_by_priority_map: dict[str, int] = {}
@@ -2645,6 +2691,7 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
         for item, quote in zip(quote_targets, quotes):
             item["quote"] = quote if quote else {}
 
+    asset_items = _hydrate_ai_chat_asset_valuations(asset_items)
     budgets = _load_investment_budgets(db)
     budget_status = _investment_budget_status(budgets, assets) if budgets else []
     latest_analysis = _latest_successful_analysis(db)
@@ -2717,8 +2764,8 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
 
 
 @app.get("/api/chat/context", response_model=AIChatContextResponse)
-def get_ai_chat_context(db: Session = Depends(get_db)):
-    context, meta = _build_ai_chat_context(db, include_live_quotes=False)
+def get_ai_chat_context(include_live_quotes: bool = Query(True), db: Session = Depends(get_db)):
+    context, meta = _build_ai_chat_context(db, include_live_quotes=include_live_quotes)
     sample_questions = [
         "我的整体资产组合目前最大的风险是什么？",
         "请结合持仓和标的池，给我一份本周重点观察清单。",

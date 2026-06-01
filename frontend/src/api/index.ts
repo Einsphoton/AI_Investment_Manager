@@ -288,7 +288,8 @@ export const investmentAdviceApi = {
 }
 
 export const chatApi = {
-  context: () => api.get<AIChatContextResponse>('/chat/context').then(r => r.data),
+  context: (includeLiveQuotes = true) =>
+    api.get<AIChatContextResponse>('/chat/context', { params: { include_live_quotes: includeLiveQuotes } }).then(r => r.data),
   ask: (message: string, history: AIChatMessage[] = [], includeLiveQuotes = true) =>
     api.post<AIChatResponse>('/chat', { message, history, include_live_quotes: includeLiveQuotes }).then(r => r.data),
 }

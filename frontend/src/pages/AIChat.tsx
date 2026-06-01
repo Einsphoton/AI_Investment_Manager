@@ -26,16 +26,11 @@ import {
   UserOutlined,
 } from '@ant-design/icons'
 import {
-  Bar,
-  BarChart,
-  CartesianGrid,
   Cell,
   Pie,
   PieChart,
   ResponsiveContainer,
   Tooltip as ChartTooltip,
-  XAxis,
-  YAxis,
 } from 'recharts'
 import { AIChatContextResponse, AIChatMessage, chatApi } from '../api'
 
@@ -280,7 +275,7 @@ export default function AIChat() {
   const loadContext = async () => {
     setContextLoading(true)
     try {
-      const data = await chatApi.context()
+      const data = await chatApi.context(includeLiveQuotes)
       setContext(data)
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '上下文加载失败')
@@ -291,7 +286,7 @@ export default function AIChat() {
 
   useEffect(() => {
     loadContext()
-  }, [])
+  }, [includeLiveQuotes])
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-30)))
@@ -346,6 +341,8 @@ export default function AIChat() {
 
   const portfolio = context?.summary?.portfolio || {}
   const visual = context?.summary?.visual_data || {}
+  const pnlRows = visual.pnl_by_asset || []
+  const maxAbsPnl = Math.max(...pnlRows.map((item: any) => Math.abs(Number(item.value) || 0)), 1)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16, minHeight: 'calc(100vh - 112px)' }}>
@@ -591,35 +588,60 @@ export default function AIChat() {
                     ) : <EmptyChart />}
                   </ChartBlock>
                   <ChartBlock title="持仓盈亏">
-                    {(visual.pnl_by_asset || []).length ? (
-                      <ResponsiveContainer width="100%" height={180}>
-                        <BarChart data={visual.pnl_by_asset} layout="vertical" margin={{ top: 4, right: 12, bottom: 4, left: 8 }}>
-                          <CartesianGrid stroke="rgba(255,255,255,0.06)" horizontal={false} />
-                          <XAxis type="number" hide />
-                          <YAxis
-                            type="category"
-                            dataKey="name"
-                            width={76}
-                            tick={{ fill: '#9a9892', fontSize: 11 }}
-                            tickLine={false}
-                            axisLine={false}
-                          />
-                          <ChartTooltip
-                            formatter={(value: any, _name: any, props: any) => [
-                              `${formatAmount(Number(value))} / ${props?.payload?.pnl_percent ?? 0}%`,
-                              '盈亏',
-                            ]}
-                            contentStyle={{ background: '#1a1a24', border: '1px solid rgba(201,168,76,0.18)', borderRadius: 8, color: '#e8e6e3' }}
-                            labelStyle={{ color: '#e8e6e3' }}
-                            itemStyle={{ color: '#e8e6e3' }}
-                          />
-                          <Bar dataKey="value" radius={[4, 4, 4, 4]}>
-                            {(visual.pnl_by_asset || []).map((item: any, idx: number) => (
-                              <Cell key={idx} fill={(item.value || 0) >= 0 ? 'oklch(72% 0.14 145)' : 'oklch(65% 0.18 25)'} />
-                            ))}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
+                    {pnlRows.length ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                        {pnlRows.map((item: any, idx: number) => {
+                          const pnl = Number(item.value) || 0
+                          const color = pnl >= 0 ? 'oklch(72% 0.14 145)' : 'oklch(65% 0.18 25)'
+                          const width = `${Math.max(3, Math.abs(pnl) / maxAbsPnl * 100)}%`
+                          const name = item.name || item.code || `资产 ${idx + 1}`
+                          return (
+                            <div key={`${item.code || name}-${idx}`}>
+                              <div style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'flex-start',
+                                gap: 10,
+                                marginBottom: 4,
+                              }}>
+                                <Tooltip title={name}>
+                                  <Text style={{
+                                    color: '#9a9892',
+                                    fontSize: 12,
+                                    lineHeight: 1.35,
+                                    whiteSpace: 'normal',
+                                    wordBreak: 'break-word',
+                                  }}>
+                                    {name}
+                                  </Text>
+                                </Tooltip>
+                                <Text style={{
+                                  flex: '0 0 auto',
+                                  color,
+                                  fontSize: 12,
+                                  fontWeight: 600,
+                                  whiteSpace: 'nowrap',
+                                }}>
+                                  {formatAmount(pnl)} / {item.pnl_percent ?? 0}%
+                                </Text>
+                              </div>
+                              <div style={{
+                                height: 8,
+                                borderRadius: 4,
+                                background: 'rgba(255,255,255,0.08)',
+                                overflow: 'hidden',
+                              }}>
+                                <div style={{
+                                  width,
+                                  height: '100%',
+                                  borderRadius: 4,
+                                  background: color,
+                                }} />
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
                     ) : <EmptyChart />}
                   </ChartBlock>
                   <ChartBlock title="标的优先级">

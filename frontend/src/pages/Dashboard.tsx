@@ -474,6 +474,7 @@ export default function Dashboard() {
       precision: 2,
       prefix: <WalletOutlined style={{ ...goldStyle, fontSize: 20 }} />,
       suffix: '¥',
+      icon: <WalletOutlined />,
     },
     {
       title: '浮动盈亏',
@@ -483,6 +484,7 @@ export default function Dashboard() {
       suffix: '¥',
       valueStyle: { color: pnlColor },
       extra: `(${isPositive ? '+' : ''}${dashboard?.total_pnl_percent?.toFixed(2)}%)`,
+      icon: <ArrowIcon />,
     },
     {
       title: '已实现盈亏',
@@ -490,6 +492,7 @@ export default function Dashboard() {
       precision: 2,
       prefix: <RiseOutlined style={{ ...goldStyle, fontSize: 20 }} />,
       suffix: '¥',
+      icon: <RiseOutlined />,
     },
   ]
 
@@ -591,7 +594,7 @@ export default function Dashboard() {
       <Row gutter={[16, 16]}>
         {statCards.map((card, i) => (
           <Col xs={24} sm={12} lg={6} key={i}>
-            <Card styles={{ body: { padding: '20px 24px' } }}>
+            <Card styles={{ body: { padding: '20px 24px', minHeight: 128 } }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
                 <span style={{
                   fontSize: 12,
@@ -611,18 +614,41 @@ export default function Dashboard() {
                   alignItems: 'center',
                   justifyContent: 'center',
                   fontSize: 16,
+                  color: card.valueStyle?.color || '#c9a84c',
                 }}>
                   {card.icon}
                 </span>
               </div>
-              <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: '-0.02em', lineHeight: 1.2, color: card.valueStyle?.color || '#e8e6e3' }}>
-                {card.suffix}{card.value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              <div style={{
+                display: 'flex',
+                alignItems: 'baseline',
+                gap: 8,
+                minWidth: 0,
+                height: 34,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                color: card.valueStyle?.color || '#e8e6e3',
+              }}>
+                <span style={{
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  fontSize: 28,
+                  fontWeight: 700,
+                  lineHeight: 1.2,
+                }}>
+                  {card.suffix}{card.value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                {card.extra && (
+                  <span style={{
+                    flex: '0 0 auto',
+                    fontSize: 13,
+                    fontWeight: 600,
+                  }}>
+                    {card.extra}
+                  </span>
+                )}
               </div>
-              {card.extra && (
-                <div style={{ fontSize: 13, color: card.valueStyle?.color || '#9a9892', marginTop: 4, fontWeight: 500 }}>
-                  {card.extra}
-                </div>
-              )}
             </Card>
           </Col>
         ))}

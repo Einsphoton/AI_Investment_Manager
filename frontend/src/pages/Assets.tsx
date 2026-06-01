@@ -1362,17 +1362,27 @@ export default function Assets() {
               {...tableProps}
             />
           ) : (
-            Object.entries(groupedData()).map(([group, items]) => (
-              <div key={group} style={{ marginBottom: 24 }}>
+            Object.entries(groupedData()).map(([group, items], index, groups) => (
+              <div
+                key={group}
+                style={{
+                  marginBottom: index === groups.length - 1 ? 0 : 32,
+                  padding: 16,
+                  borderRadius: 12,
+                  background: 'rgba(17, 17, 24, 0.42)',
+                  border: '1px solid rgba(201, 168, 76, 0.12)',
+                  boxShadow: '0 10px 24px rgba(0,0,0,0.12)',
+                }}
+              >
                 <div style={{
                   display: 'flex',
                   alignItems: 'center',
                   gap: 10,
                   padding: '8px 12px',
-                  marginBottom: 8,
+                  marginBottom: 12,
                   borderRadius: 10,
-                  background: 'rgba(201, 168, 76, 0.04)',
-                  border: '1px solid rgba(201, 168, 76, 0.08)',
+                  background: 'rgba(201, 168, 76, 0.07)',
+                  border: '1px solid rgba(201, 168, 76, 0.14)',
                 }}>
                   <span style={{
                     width: 6,

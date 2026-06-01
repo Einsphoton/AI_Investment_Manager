@@ -76,6 +76,38 @@ def openai_error_detail(exc: Exception, runtime_summary: str) -> str:
     return f"{message}{hint}；当前使用配置：{runtime_summary}"
 
 
+def parse_ai_json_object(content: str) -> dict:
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("模型返回空内容")
+
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+    if text.lower().startswith("json\n"):
+        text = text.split("\n", 1)[-1].strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def text_report_fallback(content: str, default_summary: str = "AI 分析完成") -> dict:
+    text = (content or "").strip()
+    if not text:
+        text = "模型未返回可解析内容。请检查当前模型是否支持 Chat Completions、streaming，以及是否会按提示返回 JSON。"
+    first_line = next((line.strip("#* -") for line in text.splitlines() if line.strip()), "")
+    summary = first_line[:80] if first_line else default_summary
+    return {"summary": summary or default_summary, "detail": text}
+
+
 def run_ai_analysis(db: Session) -> AnalysisRecord:
     api_key = get_setting(db, "openai_api_key")
     base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
@@ -155,7 +187,10 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
             response_format={"type": "json_object"},
         )
         content = response.choices[0].message.content
-        result = json.loads(content)
+        try:
+            result = parse_ai_json_object(content)
+        except Exception:
+            result = text_report_fallback(content, "AI 返回了非 JSON 报告")
         summary = result.get("summary", "分析完成")
         detail = result.get("detail", "")
     except Exception as e:

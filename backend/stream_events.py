@@ -32,6 +32,22 @@ def get_setting(db: Session, key: str) -> str:
     return _gs(db, key)
 
 
+def _message_content(response) -> str:
+    try:
+        return response.choices[0].message.content or ""
+    except Exception:
+        return ""
+
+
+def _retry_non_stream_text(client: OpenAI, model: str, messages: list[dict]) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=False,
+    )
+    return _message_content(response)
+
+
 def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     """
     SSE generator for portfolio analysis.
@@ -50,7 +66,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
-    from ai_service import openai_error_detail, openai_runtime_summary
+    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object, text_report_fallback
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
 
     # Stage 1: Load assets (slow start)
@@ -132,12 +148,13 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     yield sse_event("progress", {"progress": 30})
 
     try:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             stream=True,
         )
 
@@ -156,18 +173,20 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
                     p = 30 + min(62, token_count * 0.5)
                     yield sse_event("progress", {"progress": round(p, 1)})
 
+        if not collected.strip():
+            yield sse_event("log", {"message": "流式响应内容为空，正在改用非流式请求重试...", "tag": "AI"})
+            collected = _retry_non_stream_text(client, model, messages)
+
         # Parse JSON result
         yield sse_event("log", {"message": "AI 响应完成，正在解析结果...", "tag": "AI"})
         yield sse_event("progress", {"progress": 95})
 
         collected_clean = collected.strip()
-        if collected_clean.startswith("```"):
-            collected_clean = collected_clean.split("\n", 1)[-1]
-            if collected_clean.endswith("```"):
-                collected_clean = collected_clean.rsplit("```", 1)[0]
-            collected_clean = collected_clean.strip()
-
-        result = json.loads(collected_clean)
+        try:
+            result = parse_ai_json_object(collected_clean)
+        except Exception:
+            yield sse_event("log", {"message": "模型返回内容不是严格 JSON，已按文本报告保存", "tag": "AI"})
+            result = text_report_fallback(collected_clean, "AI 返回了非 JSON 报告")
         summary = result.get("summary", "分析完成")
         detail = result.get("detail", "")
 
@@ -216,7 +235,7 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
-    from ai_service import openai_error_detail, openai_runtime_summary
+    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
 
@@ -297,12 +316,13 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
     yield sse_event("progress", {"progress": 35})
 
     try:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             stream=True,
         )
 
@@ -319,14 +339,18 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
                     p = 30 + min(62, token_count * 0.5)
                     yield sse_event("progress", {"progress": round(p, 1)})
 
-        collected_clean = collected.strip()
-        if collected_clean.startswith("```"):
-            collected_clean = collected_clean.split("\n", 1)[-1]
-            if collected_clean.endswith("```"):
-                collected_clean = collected_clean.rsplit("```", 1)[0]
-            collected_clean = collected_clean.strip()
+        if not collected.strip():
+            yield sse_event("log", {"message": "流式响应内容为空，正在改用非流式请求重试...", "tag": "AI"})
+            collected = _retry_non_stream_text(client, model, messages)
 
-        result = json.loads(collected_clean)
+        try:
+            result = parse_ai_json_object(collected)
+        except Exception:
+            result = {
+                "summary": "AI 返回了非 JSON 标的分析",
+                "targets": [],
+                "raw": (collected or "").strip(),
+            }
 
         # Update targets with AI analysis
         for t in targets:
@@ -388,7 +412,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
     yield sse_event("thinking", {"message": "AI 正在分析投资策略..."})
     yield sse_event("progress", {"progress": 25})
 
-    from ai_service import openai_error_detail, openai_runtime_summary
+    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     prompt, market_snapshot = _build_investment_advice_prompt(
@@ -401,12 +425,13 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
     yield sse_event("progress", {"progress": 30})
 
     try:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             stream=True,
         )
 
@@ -423,14 +448,17 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
                     p = 25 + min(67, token_count * 0.5)
                     yield sse_event("progress", {"progress": round(p, 1)})
 
-        collected_clean = collected.strip()
-        if collected_clean.startswith("```"):
-            collected_clean = collected_clean.split("\n", 1)[-1]
-            if collected_clean.endswith("```"):
-                collected_clean = collected_clean.rsplit("```", 1)[0]
-            collected_clean = collected_clean.strip()
+        if not collected.strip():
+            yield sse_event("log", {"message": "流式响应内容为空，正在改用非流式请求重试...", "tag": "AI"})
+            collected = _retry_non_stream_text(client, model, messages)
 
-        raw = json.loads(collected_clean)
+        try:
+            raw = parse_ai_json_object(collected)
+        except Exception:
+            raw = {
+                "summary": "AI 返回了非 JSON 投资建议",
+                "advice": [],
+            }
 
         from main import _normalize_investment_advice
         result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status, market_snapshot)

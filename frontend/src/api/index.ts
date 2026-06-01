@@ -197,6 +197,38 @@ export interface InvestmentAdviceResponse {
   }>
 }
 
+export interface AIChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface AIChatResponse {
+  answer: string
+  model: string
+  context_meta: {
+    generated_at?: string
+    asset_count?: number
+    target_count?: number
+    budget_count?: number
+    installed_skill_count?: number
+    live_quotes?: boolean
+    [key: string]: any
+  }
+}
+
+export interface AIChatContextResponse {
+  summary: {
+    asset_count?: number
+    target_count?: number
+    budget_count?: number
+    installed_skill_count?: number
+    portfolio?: any
+    visual_data?: any
+    [key: string]: any
+  }
+  sample_questions: string[]
+}
+
 export const dashboardApi = {
   get: () => api.get<DashboardData>('/dashboard').then(r => r.data),
 }
@@ -238,6 +270,12 @@ export const investmentAdviceApi = {
     api.post<{message: string; reset_count: number}>('/investment-advice/reset-budget').then(r => r.data),
   budgetStatus: () =>
     api.get<any[]>('/investment-advice/budget-status').then(r => r.data),
+}
+
+export const chatApi = {
+  context: () => api.get<AIChatContextResponse>('/chat/context').then(r => r.data),
+  ask: (message: string, history: AIChatMessage[] = [], includeLiveQuotes = true) =>
+    api.post<AIChatResponse>('/chat', { message, history, include_live_quotes: includeLiveQuotes }).then(r => r.data),
 }
 
 export const settingsApi = {

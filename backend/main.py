@@ -27,6 +27,7 @@ from schemas import (
     AnalysisResponse, SettingsUpdate, SettingsResponse,
     DashboardData, TargetCreate, TargetUpdate, TargetResponse,
     AgentAnalysisRequest, AgentAnalysisResponse, AIRecommendConfig,
+    AIChatRequest, AIChatResponse, AIChatContextResponse,
     InvestmentAdviceAcceptRequest, InvestmentAdviceResponse,
     MarketLookupRequest, MarketLookupResponse,
     MarketQuoteRequest, MarketQuoteResponse,
@@ -2350,6 +2351,276 @@ def get_latest_investment_advice(db: Session = Depends(get_db)):
         'market_snapshot': {},
         'decision_audit': [],
     }
+
+
+def _chat_text(value, limit: int = 6000) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[:limit] + "\n...(内容已截断)"
+
+
+def _latest_investment_advice_context(db: Session) -> dict:
+    try:
+        from models import InvestmentAdviceRecord
+        record = db.query(InvestmentAdviceRecord).order_by(InvestmentAdviceRecord.created_at.desc()).first()
+        if not record:
+            return {}
+        return {
+            "summary": record.summary or "",
+            "advice": _safe_json_loads(record.advice_json, [])[:12],
+            "budget_status": _safe_json_loads(record.budget_status_json, []),
+            "created_at": record.created_at.isoformat() if record.created_at else "",
+        }
+    except Exception:
+        return {}
+
+
+def _chat_group_sum(items: list[dict], key: str, value_key: str = "market_value") -> list[dict]:
+    grouped: dict[str, float] = {}
+    for item in items:
+        name = str(item.get(key) or "未分类")
+        value = _normalize_ai_number(item.get(value_key), 0)
+        if value <= 0:
+            continue
+        grouped[name] = grouped.get(name, 0) + value
+    return [
+        {"name": name, "value": round(value, 2)}
+        for name, value in sorted(grouped.items(), key=lambda pair: pair[1], reverse=True)
+    ]
+
+
+def _build_ai_chat_visual_data(asset_items: list[dict], target_items: list[dict], budget_status: list[dict], portfolio: dict) -> dict:
+    allocation_by_market = []
+    for item in _chat_group_sum(asset_items, "market"):
+        allocation_by_market.append({
+            **item,
+            "label": _market_label(item["name"]),
+        })
+
+    allocation_by_type = []
+    for item in _chat_group_sum(asset_items, "asset_type"):
+        allocation_by_type.append({
+            **item,
+            "label": _asset_type_label(item["name"]),
+        })
+
+    pnl_by_asset = sorted([
+        {
+            "name": item.get("name") or item.get("code"),
+            "code": item.get("code"),
+            "value": round(_normalize_ai_number(item.get("total_pnl"), 0), 2),
+            "pnl_percent": round(_normalize_ai_number(item.get("total_pnl_percent"), 0), 2),
+        }
+        for item in asset_items
+    ], key=lambda row: abs(row["value"]), reverse=True)[:8]
+
+    priority_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    targets_by_priority_map: dict[str, int] = {}
+    for item in target_items:
+        priority = str(item.get("priority") or "MEDIUM").upper()
+        targets_by_priority_map[priority] = targets_by_priority_map.get(priority, 0) + 1
+    targets_by_priority = [
+        {"name": key, "label": {"HIGH": "高", "MEDIUM": "中", "LOW": "低"}.get(key, key), "value": value}
+        for key, value in sorted(targets_by_priority_map.items(), key=lambda pair: priority_order.get(pair[0], 99))
+    ]
+
+    budget_remaining = [
+        {
+            "name": item.get("platform") or item.get("id"),
+            "amount": round(_normalize_ai_number(item.get("amount"), 0), 2),
+            "remaining": round(_normalize_ai_number(item.get("remaining_amount"), 0), 2),
+            "used": round(_normalize_ai_number(item.get("used_amount"), 0), 2),
+            "currency": item.get("currency"),
+        }
+        for item in budget_status
+    ][:8]
+
+    return {
+        "portfolio_valuation": [
+            {"name": "成本", "value": portfolio.get("total_cost", 0)},
+            {"name": "市值", "value": portfolio.get("total_market_value", 0)},
+        ],
+        "allocation_by_market": allocation_by_market,
+        "allocation_by_type": allocation_by_type,
+        "allocation_by_platform": _chat_group_sum(asset_items, "platform"),
+        "pnl_by_asset": pnl_by_asset,
+        "targets_by_priority": targets_by_priority,
+        "budget_remaining": budget_remaining,
+    }
+
+
+def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tuple[dict, dict]:
+    assets = db.query(Asset).order_by(Asset.created_at.desc()).all()
+    active_targets = db.query(Target).filter(Target.status == "active").order_by(Target.created_at.desc()).all()
+    removed_targets_count = db.query(Target).filter(Target.status != "active").count()
+    providers = _read_providers(db)
+
+    asset_items = [_asset_analysis_data(asset) for asset in assets]
+    for asset, item in zip(assets, asset_items):
+        item.update({
+            "source": asset.source,
+            "price_updated_at": asset.price_updated_at,
+        })
+
+    target_items = [{
+        "id": target.id,
+        "code": target.code,
+        "name": target.name or target.code,
+        "market": target.market,
+        "asset_type": target.asset_type,
+        "source": target.source,
+        "priority": target.priority,
+        "risk_level": target.risk_level,
+        "expected_return": target.expected_return,
+        "reason": target.reason,
+        "note": target.note,
+        "last_analyzed_at": target.last_analyzed_at,
+        "ai_analysis": _safe_json_loads(target.ai_analysis, {}),
+    } for target in active_targets]
+
+    if include_live_quotes:
+        quote_targets = asset_items + target_items[:80]
+        quotes = parallel_map(
+            lambda item: _quote_for_investment_item(item, providers),
+            quote_targets,
+            max_workers=5,
+            timeout=25,
+        ) if quote_targets else []
+        for item, quote in zip(quote_targets, quotes):
+            item["quote"] = quote if quote else {}
+
+    budgets = _load_investment_budgets(db)
+    budget_status = _investment_budget_status(budgets, assets) if budgets else []
+    latest_analysis = _latest_successful_analysis(db)
+    latest_asset_analysis = _latest_today_asset_analysis(db, assets)
+    latest_advice = _latest_investment_advice_context(db)
+
+    total_cost = sum(item.get("total_cost", 0) for item in asset_items)
+    total_market_value = sum(item.get("market_value", 0) for item in asset_items)
+    total_pnl = total_market_value - total_cost
+    portfolio = {
+        "total_cost": round(total_cost, 2),
+        "total_market_value": round(total_market_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_percent": round((total_pnl / total_cost * 100) if total_cost else 0, 2),
+        "holding_count": len(asset_items),
+        "target_count": len(target_items),
+        "removed_target_count": removed_targets_count,
+    }
+    visual_data = _build_ai_chat_visual_data(asset_items, target_items, budget_status, portfolio)
+
+    datasource_config = {
+        "stock": {
+            market: PROVIDER_LABELS.get(provider, provider)
+            for market, provider in providers.get("stock", {}).items()
+        },
+        "fund": {
+            market: PROVIDER_LABELS.get(provider, provider)
+            for market, provider in providers.get("fund", {}).items()
+        },
+    }
+    ai_config = {
+        "model": get_setting(db, "openai_model") or "gpt-4o-mini",
+        "base_url": get_setting(db, "openai_base_url") or "https://api.openai.com/v1",
+        "personality": get_setting(db, "ai_personality") or "balanced",
+        "report_style": get_setting(db, "ai_report_style") or "professional",
+    }
+
+    context = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "app": {
+            "name": "AI 投资分析平台",
+            "capabilities": ["资产管理", "标的池", "AI 资产分析", "AI 投资建议", "Skill 市场", "OCR 导入"],
+            "installed_skills": get_installed_skill_names(db),
+            "datasource_config": datasource_config,
+            "ai_config": ai_config,
+        },
+        "portfolio": portfolio,
+        "visual_data": visual_data,
+        "assets": asset_items,
+        "targets": target_items,
+        "investment_budgets": budget_status,
+        "latest_portfolio_analysis": {
+            "summary": latest_analysis.summary,
+            "detail": _safe_json_loads(latest_analysis.detail, latest_analysis.detail),
+            "created_at": latest_analysis.created_at.isoformat() if latest_analysis.created_at else "",
+        } if latest_analysis else {},
+        "latest_asset_analysis_today": latest_asset_analysis,
+        "latest_investment_advice": latest_advice,
+    }
+    meta = {
+        "generated_at": context["generated_at"],
+        "asset_count": len(asset_items),
+        "target_count": len(target_items),
+        "budget_count": len(budget_status),
+        "installed_skill_count": len(context["app"]["installed_skills"]),
+        "live_quotes": include_live_quotes,
+        "visual_data": visual_data,
+    }
+    return context, meta
+
+
+@app.get("/api/chat/context", response_model=AIChatContextResponse)
+def get_ai_chat_context(db: Session = Depends(get_db)):
+    context, meta = _build_ai_chat_context(db, include_live_quotes=False)
+    sample_questions = [
+        "我的整体资产组合目前最大的风险是什么？",
+        "请结合持仓和标的池，给我一份本周重点观察清单。",
+        "哪些持仓需要减仓或继续持有？请说明证据。",
+        "如果我只想降低回撤，下一步应该怎么调整？",
+    ]
+    return AIChatContextResponse(summary={**meta, "portfolio": context["portfolio"], "visual_data": context["visual_data"]}, sample_questions=sample_questions)
+
+
+@app.post("/api/chat", response_model=AIChatResponse)
+def run_ai_chat(req: AIChatRequest, db: Session = Depends(get_db)):
+    api_key = get_setting(db, "openai_api_key")
+    base_url = get_setting(db, "openai_base_url")
+    model = get_setting(db, "openai_model") or "gpt-4o-mini"
+    personality = get_setting(db, "ai_personality") or "balanced"
+    report_style = get_setting(db, "ai_report_style") or "professional"
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先在设置页面配置 OpenAI API Key")
+
+    from agent.personality import build_system_prompt
+    base_system = build_system_prompt(personality, report_style)
+    context, meta = _build_ai_chat_context(db, include_live_quotes=req.include_live_quotes)
+    context_json = json.dumps(context, ensure_ascii=False, default=str)
+    if len(context_json) > 70000:
+        context_json = context_json[:70000] + "\n...(上下文较大，已截断；请优先依据已展示数据回答，并说明可能缺失的信息)"
+
+    system_prompt = f"""{base_system}
+
+你是这个投资管理 APP 内置的 AI Chat。你可以基于用户当前 APP 数据、所有持仓、已配置标的池、最近分析记录、投资额度、数据源和已安装技能回答问题。
+要求：
+1. 所有判断必须基于提供的上下文；数据不足时直接说明，不要编造行情、估值或财务指标。
+2. 使用 Markdown 输出，优先使用二级/三级标题、项目符号、编号列表、Markdown 表格和加粗重点；不要返回 HTML。
+3. 回答要比普通摘要更详尽：先给结论，再给证据、风险、可执行观察项或下一步动作。
+4. 涉及交易时必须提示这不是投资承诺，并说明关键不确定性。
+5. 不要泄露或推测 API Key 等敏感配置。"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"当前 APP 上下文如下：\n{context_json}"},
+    ]
+    for item in req.history[-12:]:
+        role = item.role if item.role in {"user", "assistant"} else "user"
+        content = _chat_text(item.content, 3000)
+        if content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": req.message.strip()})
+
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=120)
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+        answer = response.choices[0].message.content or ""
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI Chat 调用失败: {str(e)}")
+
+    return AIChatResponse(answer=answer, model=model, context_meta=meta)
 
 
 def _find_asset_for_advice(db: Session, advice: dict) -> Asset | None:

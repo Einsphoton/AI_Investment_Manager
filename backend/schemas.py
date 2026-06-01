@@ -209,6 +209,28 @@ class InvestmentAdviceResponse(BaseModel):
     decision_audit: list[dict] = []
 
 
+class AIChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class AIChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=8000)
+    history: list[AIChatMessage] = []
+    include_live_quotes: bool = True
+
+
+class AIChatResponse(BaseModel):
+    answer: str
+    model: str
+    context_meta: dict = {}
+
+
+class AIChatContextResponse(BaseModel):
+    summary: dict = {}
+    sample_questions: list[str] = []
+
+
 class MarketLookupRequest(BaseModel):
     code: str
     market: str

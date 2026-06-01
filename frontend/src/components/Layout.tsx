@@ -7,6 +7,7 @@ import {
   AppstoreOutlined,
   ScanOutlined,
   BulbOutlined,
+  MessageOutlined,
 } from '@ant-design/icons'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import AIProgressOverlay from './AIProgressOverlay'
@@ -38,6 +39,11 @@ const menuItems = [
     key: '/investment-advice',
     icon: <BulbOutlined />,
     label: 'AI 投资建议',
+  },
+  {
+    key: '/chat',
+    icon: <MessageOutlined />,
+    label: 'AI Chat',
   },
   {
     key: '/skills',

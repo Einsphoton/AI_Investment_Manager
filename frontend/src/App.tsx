@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard'
 import Assets from './pages/Assets'
 import Targets from './pages/Targets'
 import InvestmentAdvice from './pages/InvestmentAdvice'
+import AIChat from './pages/AIChat'
 import SkillMarket from './pages/SkillMarket'
 import Settings from './pages/Settings'
 import Ocr from './pages/Ocr'
@@ -20,6 +21,7 @@ export default function App() {
           <Route path="/assets" element={<ErrorBoundary><Assets /></ErrorBoundary>} />
           <Route path="/targets" element={<ErrorBoundary><Targets /></ErrorBoundary>} />
           <Route path="/investment-advice" element={<ErrorBoundary><InvestmentAdvice /></ErrorBoundary>} />
+          <Route path="/chat" element={<ErrorBoundary><AIChat /></ErrorBoundary>} />
           <Route path="/skills" element={<ErrorBoundary><SkillMarket /></ErrorBoundary>} />
           <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
           <Route path="/ocr" element={<ErrorBoundary><Ocr /></ErrorBoundary>} />

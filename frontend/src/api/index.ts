@@ -256,7 +256,7 @@ export const analysisApi = {
   run: (includeTargets?: boolean) => api.post<AnalysisRecord>(`/analysis/run${includeTargets ? '?include_targets=true' : ''}`).then(r => r.data),
   latest: () => api.get<AnalysisRecord>('/analysis/latest').then(r => r.data),
   history: () => api.get<AnalysisRecord[]>('/analysis/history').then(r => r.data),
-  agentRun: (req?: { asset_ids?: number[]; target_ids?: number[]; goal?: string }) =>
+  agentRun: (req?: { asset_ids?: number[]; target_ids?: number[]; goal?: string; save_portfolio_record?: boolean }) =>
     api.post<AgentAnalysisResponse>('/analysis/agent-run', req || { goal: '全面分析投资组合' }).then(r => r.data),
 }
 

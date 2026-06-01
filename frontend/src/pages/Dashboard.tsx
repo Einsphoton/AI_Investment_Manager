@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import type { ReactNode } from 'react'
 import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
   Card, Row, Col, Statistic, Button, Spin, Typography, Space, Table, Tag, Switch, message
@@ -10,11 +11,185 @@ import {
 import { dashboardApi, analysisApi, assetsApi, targetsApi, investmentAdviceApi, parallelApi, DashboardData, AnalysisRecord, Asset } from '../api'
 import { useNavigate } from 'react-router-dom'
 
-const { Text, Paragraph } = Typography
+const { Text } = Typography
 
 const goldStyle = { color: '#c9a84c' }
 const greenStyle = { color: 'oklch(72% 0.14 145)' }
 const redStyle = { color: 'oklch(65% 0.18 25)' }
+
+const renderInlineMarkdown = (text: string): ReactNode[] => (
+  text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean).map((part, idx) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={idx} style={{ color: '#f3df99' }}>{part.slice(2, -2)}</strong>
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return (
+        <code key={idx} style={{
+          padding: '1px 5px',
+          borderRadius: 5,
+          background: 'rgba(255,255,255,0.08)',
+          color: '#f6c177',
+        }}>
+          {part.slice(1, -1)}
+        </code>
+      )
+    }
+    return part
+  })
+)
+
+function MarkdownBrief({ content }: { content: string }) {
+  const lines = content.replace(/\r\n/g, '\n').split('\n')
+  const nodes: ReactNode[] = []
+  let i = 0
+  const isTableSeparator = (line?: string) => !!line && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(line)
+
+  while (i < lines.length) {
+    const trimmed = lines[i].trim()
+    if (!trimmed) {
+      i += 1
+      continue
+    }
+
+    if (trimmed.startsWith('```')) {
+      const codeLines: string[] = []
+      i += 1
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i])
+        i += 1
+      }
+      i += 1
+      nodes.push(
+        <pre key={`code-${i}`} style={{
+          margin: '10px 0',
+          padding: 12,
+          overflowX: 'auto',
+          borderRadius: 8,
+          background: 'rgba(0,0,0,0.26)',
+          border: '1px solid rgba(255,255,255,0.08)',
+        }}>
+          <code style={{ color: '#e8e6e3' }}>{codeLines.join('\n')}</code>
+        </pre>,
+      )
+      continue
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/)
+    if (heading) {
+      const level = heading[1].length
+      nodes.push(
+        <div key={`h-${i}`} style={{
+          margin: level <= 2 ? '14px 0 8px' : '10px 0 6px',
+          color: level <= 2 ? '#f3df99' : '#e8e6e3',
+          fontWeight: 700,
+          fontSize: level <= 2 ? 16 : 14,
+        }}>
+          {renderInlineMarkdown(heading[2])}
+        </div>,
+      )
+      i += 1
+      continue
+    }
+
+    if (trimmed.includes('|') && isTableSeparator(lines[i + 1])) {
+      const header = trimmed.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim())
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && lines[i].trim().includes('|')) {
+        rows.push(lines[i].trim().replace(/^\||\|$/g, '').split('|').map(cell => cell.trim()))
+        i += 1
+      }
+      nodes.push(
+        <div key={`table-${i}`} style={{ overflowX: 'auto', margin: '10px 0' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead>
+              <tr>
+                {header.map((cell, idx) => (
+                  <th key={idx} style={{ textAlign: 'left', padding: '7px 8px', color: '#f3df99', borderBottom: '1px solid rgba(201,168,76,0.18)' }}>
+                    {renderInlineMarkdown(cell)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIdx) => (
+                <tr key={rowIdx}>
+                  {header.map((_, cellIdx) => (
+                    <td key={cellIdx} style={{ padding: '7px 8px', color: '#d6d1c8', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                      {renderInlineMarkdown(row[cellIdx] || '')}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      continue
+    }
+
+    if (/^[-*]\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed)) {
+      const ordered = /^\d+\.\s+/.test(trimmed)
+      const items: string[] = []
+      while (i < lines.length) {
+        const item = lines[i].trim()
+        if (ordered && /^\d+\.\s+/.test(item)) {
+          items.push(item.replace(/^\d+\.\s+/, ''))
+          i += 1
+        } else if (!ordered && /^[-*]\s+/.test(item)) {
+          items.push(item.replace(/^[-*]\s+/, ''))
+          i += 1
+        } else {
+          break
+        }
+      }
+      const ListTag = ordered ? 'ol' : 'ul'
+      nodes.push(
+        <ListTag key={`list-${i}`} style={{ margin: '8px 0 8px 20px', paddingLeft: 12 }}>
+          {items.map((item, idx) => (
+            <li key={idx} style={{ marginBottom: 5, color: '#d6d1c8', lineHeight: 1.72 }}>
+              {renderInlineMarkdown(item)}
+            </li>
+          ))}
+        </ListTag>,
+      )
+      continue
+    }
+
+    if (trimmed.startsWith('>')) {
+      const quoteLines: string[] = []
+      while (i < lines.length && lines[i].trim().startsWith('>')) {
+        quoteLines.push(lines[i].trim().replace(/^>\s?/, ''))
+        i += 1
+      }
+      nodes.push(
+        <blockquote key={`quote-${i}`} style={{
+          margin: '10px 0',
+          padding: '8px 12px',
+          borderLeft: '3px solid #c9a84c',
+          background: 'rgba(201,168,76,0.08)',
+          color: '#d8d3c8',
+        }}>
+          {renderInlineMarkdown(quoteLines.join(' '))}
+        </blockquote>,
+      )
+      continue
+    }
+
+    const paragraph: string[] = []
+    while (i < lines.length && lines[i].trim() && !/^(#{1,4})\s+/.test(lines[i].trim()) && !/^[-*]\s+/.test(lines[i].trim()) && !/^\d+\.\s+/.test(lines[i].trim()) && !lines[i].trim().startsWith('>') && !lines[i].trim().startsWith('```')) {
+      paragraph.push(lines[i].trim())
+      i += 1
+    }
+    nodes.push(
+      <p key={`p-${i}`} style={{ margin: '8px 0', color: '#d6d1c8', fontSize: 13, lineHeight: 1.78 }}>
+        {renderInlineMarkdown(paragraph.join(' '))}
+      </p>,
+    )
+  }
+
+  return <div>{nodes}</div>
+}
 
 export default function Dashboard() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null)
@@ -60,6 +235,15 @@ export default function Dashboard() {
 
   const getErrorDetail = (e: any): string => {
     return e?.response?.data?.detail || e?.message || '未知错误'
+  }
+
+  const runAssetDetailAnalysis = async () => {
+    if (assets.length === 0) return
+    await analysisApi.agentRun({
+      asset_ids: assets.map(asset => asset.id),
+      goal: '请为当前全部持仓生成用于资产详情页展示的逐项 AI 分析报告。每项资产都要覆盖宏观影响、微观因素、基本面、技术面、风险提示和具体操作建议。',
+      save_portfolio_record: false,
+    })
   }
 
   const runAnalysis = async () => {
@@ -118,8 +302,10 @@ export default function Dashboard() {
                 return
               }
             }
+            aiCtx.updateSubTask('portfolio', { status: 'running', progress: 88, thinking: '正在写入资产详情分析...' })
+            await runAssetDetailAnalysis()
             aiCtx.updateSubTask('portfolio', { status: 'completed', progress: 100, thinking: '分析完成' })
-            aiCtx.addLog('✅ AI 资产分析完成', 'success', '资产分析')
+            aiCtx.addLog('✅ AI 资产分析与详情报告完成', 'success', '资产分析')
           },
         })
         if (includeTargets) {
@@ -223,7 +409,9 @@ export default function Dashboard() {
           }
         }
         if (portfolioSucceeded) {
-          aiCtx.addLog('✅ AI 资产分析完成', 'success')
+          aiCtx.addLog('正在生成资产详情页分析报告...', 'info')
+          await runAssetDetailAnalysis()
+          aiCtx.addLog('✅ AI 资产分析与详情报告完成', 'success')
         }
 
         if (includeTargets) {
@@ -473,15 +661,7 @@ export default function Dashboard() {
                   background: 'rgba(26, 26, 36, 0.5)',
                   border: '1px solid rgba(255,255,255,0.04)',
                 }}>
-                  <Paragraph style={{
-                    whiteSpace: 'pre-wrap',
-                    margin: 0,
-                    color: '#b0aea8',
-                    fontSize: 13,
-                    lineHeight: 1.7,
-                  }}>
-                    {analysis.detail}
-                  </Paragraph>
+                  <MarkdownBrief content={analysis.detail} />
                 </div>
                 <div style={{
                   display: 'flex',

@@ -562,7 +562,9 @@ export default function AIChat() {
                           </Pie>
                           <ChartTooltip
                             formatter={(value: any) => formatAmount(Number(value))}
-                            contentStyle={{ background: '#1a1a24', border: '1px solid rgba(201,168,76,0.18)', borderRadius: 8 }}
+                            contentStyle={{ background: '#1a1a24', border: '1px solid rgba(201,168,76,0.18)', borderRadius: 8, color: '#e8e6e3' }}
+                            labelStyle={{ color: '#e8e6e3' }}
+                            itemStyle={{ color: '#e8e6e3' }}
                           />
                         </PieChart>
                       </ResponsiveContainer>
@@ -607,7 +609,9 @@ export default function AIChat() {
                               `${formatAmount(Number(value))} / ${props?.payload?.pnl_percent ?? 0}%`,
                               '盈亏',
                             ]}
-                            contentStyle={{ background: '#1a1a24', border: '1px solid rgba(201,168,76,0.18)', borderRadius: 8 }}
+                            contentStyle={{ background: '#1a1a24', border: '1px solid rgba(201,168,76,0.18)', borderRadius: 8, color: '#e8e6e3' }}
+                            labelStyle={{ color: '#e8e6e3' }}
+                            itemStyle={{ color: '#e8e6e3' }}
                           />
                           <Bar dataKey="value" radius={[4, 4, 4, 4]}>
                             {(visual.pnl_by_asset || []).map((item: any, idx: number) => (

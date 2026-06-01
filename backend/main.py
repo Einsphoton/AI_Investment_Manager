@@ -336,7 +336,13 @@ def _is_failed_analysis_record(record: AnalysisRecord | None) -> bool:
 
 
 def _latest_successful_analysis(db: Session) -> AnalysisRecord | None:
-    records = db.query(AnalysisRecord).order_by(AnalysisRecord.created_at.desc()).limit(20).all()
+    records = (
+        db.query(AnalysisRecord)
+        .filter(AnalysisRecord.asset_id.is_(None))
+        .order_by(AnalysisRecord.created_at.desc())
+        .limit(20)
+        .all()
+    )
     return next((record for record in records if not _is_failed_analysis_record(record)), None)
 
 
@@ -500,10 +506,14 @@ def _fallback_asset_recommendation(asset: dict, reason: str = "") -> dict:
         "time_horizon": "MEDIUM",
         "confidence_score": 35,
         "summary": f"当前浮动盈亏约 {pnl_pct:.2f}%，建议先持有观察。",
+        "position_diagnosis": "该资产当前分析仅基于持仓成本、当前价和可用行情信息，暂无法形成完整仓位诊断。",
         "macro_impact": "宏观分析暂不可用，需结合利率、流动性和市场风险偏好继续跟踪。",
         "micro_factors": "暂未获得足够微观信息，优先关注规模、费率、持仓结构、管理人稳定性和资金流向。",
         "fundamentals_analysis": "实时基本面数据不足，暂不编造估值或财务指标。",
+        "valuation_analysis": "估值数据不足，不能判断当前价格相对内在价值是否具备安全边际。",
         "technical_analysis": "价格历史数据不足，仅能基于买入价和当前价判断持仓盈亏状态。",
+        "action_plan": "暂不做交易操作；先补齐行情、估值和近期走势数据，再决定是否加仓、减仓或止损。",
+        "watch_points": "后续重点观察净值/价格是否继续偏离成本、基本面数据是否改善、同类资产是否出现更优替代。",
         "risk_warning": "数据源或 AI 分析暂不可用时，操作建议可信度较低。",
         "data_quality": reason or "fallback",
     }
@@ -592,13 +602,14 @@ def _run_compact_asset_ai_analysis(
 
 要求：
 1. 必须只分析上面列出的资产，不要加入未列出的标的。
-2. 对每一项资产都给出完整报告，覆盖宏观影响、微观因素、基本面数据、技术面走势、风险提示和具体交易建议。
+2. 对每一项资产都给出完整报告，覆盖仓位诊断、宏观影响、微观因素、估值/基本面、技术面走势、风险提示、观察点和具体交易建议。
 3. 数据不足时直接说明“数据不足”，不要编造不存在的财务指标。
 4. suggested_quantity 必须是数字；不建议操作时返回 0。
+5. 每个分析字段都要有实质信息；除 summary 外，文字字段建议 80-220 字，不要只写一句空泛结论。
 
 请只返回 JSON，格式如下：
 {{
-  "summary": "整体结论，120字以内",
+  "summary": "整体结论，150字以内",
   "macro_analysis": {{
     "global_overview": "全球/市场环境概述",
     "china_economy": "中国市场相关判断",
@@ -609,17 +620,21 @@ def _run_compact_asset_ai_analysis(
       "asset_code": "代码",
       "asset_name": "名称",
       "final_suggestion": "BUY/SELL/HOLD/ADD/REDUCE 之一",
-      "suggested_action": "具体操作建议，120字以内",
+      "suggested_action": "具体操作建议，说明现在做什么、不做什么、触发条件是什么，180字以内",
       "suggested_quantity": 0,
       "target_price": 0,
       "stop_loss": 0,
       "time_horizon": "SHORT/MEDIUM/LONG 之一",
       "confidence_score": 0,
       "summary": "该资产一句话结论",
+      "position_diagnosis": "结合买入价、当前价、持仓盈亏和仓位状态做诊断",
       "macro_impact": "宏观影响分析",
       "micro_factors": "微观因素分析",
       "fundamentals_analysis": "基本面数据分析",
+      "valuation_analysis": "估值、性价比或同类比较分析；数据不足时说明缺口",
       "technical_analysis": "技术面走势分析",
+      "action_plan": "分情景行动计划，例如继续持有/加仓/减仓/止损的触发条件",
+      "watch_points": "后续重点观察的 3-5 个指标或事件",
       "risk_warning": "风险提示",
       "data_quality": "使用了哪些数据，以及缺失哪些数据"
     }}
@@ -1513,7 +1528,13 @@ def get_latest_analysis(db: Session = Depends(get_db)):
 
 @app.get("/api/analysis/history", response_model=list[AnalysisResponse])
 def get_analysis_history(db: Session = Depends(get_db)):
-    return db.query(AnalysisRecord).order_by(AnalysisRecord.created_at.desc()).limit(50).all()
+    return (
+        db.query(AnalysisRecord)
+        .filter(AnalysisRecord.asset_id.is_(None))
+        .order_by(AnalysisRecord.created_at.desc())
+        .limit(50)
+        .all()
+    )
 
 
 @app.get("/api/settings/parallel-config")
@@ -1623,7 +1644,16 @@ def market_quote(req: MarketQuoteRequest, db: Session = Depends(get_db)):
     providers = _read_providers(db)
     result = get_quote(req.code.strip().upper(), req.market, req.asset_type, providers, req.force_refresh)
     if not result:
-        raise HTTPException(status_code=404, detail="无法获取行情数据")
+        return MarketQuoteResponse(
+            name=None,
+            code=req.code,
+            market=req.market,
+            current_price=None,
+            prev_close=None,
+            change=None,
+            change_pct=None,
+            source=None,
+        )
     return MarketQuoteResponse(
         name=result.get('name'),
         code=result.get('code', req.code),
@@ -2178,7 +2208,6 @@ def agent_analysis_run(req: AgentAnalysisRequest, db: Session = Depends(get_db))
             asset_data=asset_data,
             fundamentals_map=fundamentals_map,
             history_map=history_map,
-            db_session=db,
         )
 
         total_market_value = sum(a.get("market_value", 0) for a in asset_data)
@@ -2186,15 +2215,16 @@ def agent_analysis_run(req: AgentAnalysisRequest, db: Session = Depends(get_db))
         total_pnl = sum(a.get("total_pnl", 0) for a in asset_data)
         total_pnl_percent = (total_pnl / total_cost * 100) if total_cost else 0
 
-        record = AnalysisRecord(
-            summary=result.get("summary", "AI 分析完成"),
-            detail=json.dumps(result, ensure_ascii=False, default=str),
-            total_market_value=total_market_value,
-            total_cost=total_cost,
-            total_pnl=total_pnl,
-            total_pnl_percent=total_pnl_percent,
-        )
-        db.add(record)
+        if req.save_portfolio_record:
+            record = AnalysisRecord(
+                summary=result.get("summary", "AI 分析完成"),
+                detail=json.dumps(result, ensure_ascii=False, default=str),
+                total_market_value=total_market_value,
+                total_cost=total_cost,
+                total_pnl=total_pnl,
+                total_pnl_percent=total_pnl_percent,
+            )
+            db.add(record)
 
         asset_by_id = {a.id: a for a in assets}
         for rec in result.get("asset_analyses", []):

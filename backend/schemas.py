@@ -189,6 +189,7 @@ class AgentAnalysisRequest(BaseModel):
     asset_ids: list[int] = []
     target_ids: list[int] = []
     goal: str = "全面分析投资组合"
+    save_portfolio_record: bool = True
 
 
 class AgentAnalysisResponse(BaseModel):

@@ -103,7 +103,7 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
 请返回 JSON 格式：
 {{
   "summary": "一句话总结（50字以内）",
-  "detail": "详细分析报告（包括市场回顾、各资产表现（引用真实PE/PB）、风险提示和操作建议，200-500字）"
+  "detail": "Markdown 格式的详细分析报告（使用 ##/### 标题、项目符号、Markdown 表格和 **重点加粗**；包括市场回顾、各资产表现（引用真实PE/PB）、风险提示和操作建议，200-500字）"
 }}"""
 
     client = OpenAI(api_key=api_key, base_url=base_url or None)

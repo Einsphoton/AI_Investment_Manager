@@ -186,8 +186,27 @@ const renderTradeType = (type: string) => (
   </Tag>
 )
 
+const mergeAssetMarketFields = (nextAssets: Asset[], previousAssets: Asset[]) => {
+  const previousById = new Map(previousAssets.map(asset => [asset.id, asset]))
+  return nextAssets.map(asset => mergeAssetMarketField(asset, previousById.get(asset.id)))
+}
+
+const mergeAssetMarketField = (asset: Asset, previous?: Asset | null) => {
+  if (!previous) return asset
+  if (previous.id !== asset.id) return asset
+  const nextHasPrice = asset.current_price != null && asset.current_price > 0
+  const previousHasPrice = previous.current_price != null && previous.current_price > 0
+  if (nextHasPrice || !previousHasPrice) return asset
+  return {
+    ...asset,
+    current_price: previous.current_price,
+    price_updated_at: previous.price_updated_at || asset.price_updated_at,
+  }
+}
+
 export default function Assets() {
   const [assets, setAssets] = useState<Asset[]>([])
+  const assetsRef = useRef<Asset[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [modalOpen, setModalOpen] = useState(false)
@@ -212,6 +231,37 @@ export default function Assets() {
   const priceHistorySeqRef = useRef(0)
   const detailHistoryPrefetchKeyRef = useRef<string | null>(null)
   const marketWarmupSeqRef = useRef(0)
+
+  const fillDetailPriceFromHistory = useCallback((
+    assetId: number,
+    history: MarketHistoryItem[] | undefined,
+    options?: { force?: boolean },
+  ) => {
+    const latest = [...(history || [])].reverse().find(item => item.price != null && item.price > 0)
+    if (!latest) return
+
+    const updatedAt = latest.date || new Date().toISOString()
+    const fillAsset = (asset: Asset) => {
+      if (asset.id !== assetId) return asset
+      const hasCurrentPrice = asset.current_price != null && asset.current_price > 0
+      if (hasCurrentPrice && !options?.force) return asset
+      return {
+        ...asset,
+        current_price: latest.price,
+        price_updated_at: updatedAt,
+      }
+    }
+
+    setSelectedAsset(prev => prev ? fillAsset(prev) : prev)
+    setAssetDetail(prev => (
+      prev?.asset.id === assetId ? { ...prev, asset: fillAsset(prev.asset) } : prev
+    ))
+    setAssets(prev => prev.map(fillAsset))
+  }, [])
+
+  useEffect(() => {
+    assetsRef.current = assets
+  }, [assets])
 
   const idleDelay = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
 
@@ -289,8 +339,9 @@ export default function Assets() {
     setLoading(true)
     try {
       const data = await assetsApi.list()
-      setAssets(data)
-      return data
+      const mergedData = mergeAssetMarketFields(data, assetsRef.current)
+      setAssets(mergedData)
+      return mergedData
     } catch (e) {
       console.error(e)
     } finally {
@@ -303,8 +354,9 @@ export default function Assets() {
     try {
       await assetsApi.refreshPrices()
       const data = await assetsApi.list()
-      setAssets(data)
-      fetchPriceHistory(data, assetListPeriod)
+      const mergedData = mergeAssetMarketFields(data, assetsRef.current)
+      setAssets(mergedData)
+      fetchPriceHistory(mergedData, assetListPeriod)
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '刷新行情失败')
     } finally {
@@ -362,6 +414,7 @@ export default function Assets() {
         }, () => analysisApi.agentRun({
           asset_ids: batchIds,
           goal: `请对以下 ${batchIds.length} 项投资资产生成详细分析报告。覆盖宏观、微观、基本面、技术面，给出具体投资建议。`,
+          save_portfolio_record: false,
         }))
         aiCtx.updateSubTask(`batch-${i}`, { status: 'completed', progress: 100, thinking: '分析完成' })
         aiCtx.addLog(`✅ 第 ${i + 1} 批分析完成`, 'success', `批 ${i + 1}`)
@@ -495,24 +548,35 @@ export default function Assets() {
       message.success('添加成功')
     }
     setModalOpen(false)
-    fetchAssets()
+    const data = await fetchAssets()
+    if (data && data.length > 0) {
+      warmAssetsMarketData(data)
+    }
   }
 
   const loadAssetDetail = async (asset: Asset) => {
     setDetailLoading(true)
     try {
       const detail = await assetsApi.detail(asset.id)
+      const previousAsset =
+        assetDetail?.asset.id === asset.id
+          ? assetDetail.asset
+          : selectedAsset?.id === asset.id
+            ? selectedAsset
+            : assetsRef.current.find(item => item.id === asset.id) || asset
+      const hydratedAsset = mergeAssetMarketField(detail.asset, previousAsset)
+      const hydratedDetail = { ...detail, asset: hydratedAsset }
       setAssetDetail(prev => (
-        prev?.asset.id === detail.asset.id
+        prev?.asset.id === hydratedDetail.asset.id
           ? {
-              ...detail,
+              ...hydratedDetail,
               history: prev.history?.length ? prev.history : detail.history,
               fundamentals: Object.keys(prev.fundamentals || {}).length ? prev.fundamentals : detail.fundamentals,
             }
-          : detail
+          : hydratedDetail
       ))
-      setSelectedAsset(detail.asset)
-      return detail
+      setSelectedAsset(hydratedAsset)
+      return hydratedDetail
     } catch (e: any) {
       message.error(e?.response?.data?.detail || '加载资产详情失败')
       setAssetDetail({
@@ -547,7 +611,9 @@ export default function Assets() {
     let active = true
     const realtimeAsset = selectedAsset.asset_type !== 'offshore_fund'
     if (detailFullHistory.length > 0) {
-      setAssetDetail(prev => prev ? { ...prev, history: transformMarketHistory(detailFullHistory, detailPeriod, 'day') } : prev)
+      const transformedHistory = transformMarketHistory(detailFullHistory, detailPeriod, 'day')
+      setAssetDetail(prev => prev ? { ...prev, history: transformedHistory } : prev)
+      fillDetailPriceFromHistory(selectedAsset.id, transformedHistory)
       if (!realtimeAsset) {
         return () => { active = false }
       }
@@ -555,22 +621,16 @@ export default function Assets() {
     const fallback = priceHistory[selectedAsset.id]
     if (fallback?.length) {
       setAssetDetail(prev => prev ? { ...prev, history: fallback } : prev)
+      fillDetailPriceFromHistory(selectedAsset.id, fallback)
     }
     setDetailHistoryLoading(true)
     marketApi.history(selectedAsset.code, selectedAsset.market, selectedAsset.asset_type, { period: detailPeriod, interval: 'day', force_refresh: realtimeAsset })
       .then(data => {
         if (!active) return
-        if ((data.history || []).length > 0) {
-          setAssetDetail(prev => prev ? { ...prev, history: data.history || [] } : prev)
-          if (realtimeAsset) {
-            const latest = data.history[data.history.length - 1]
-            if (latest?.price) {
-              const updatedAt = new Date().toISOString()
-              setSelectedAsset(prev => prev ? { ...prev, current_price: latest.price, price_updated_at: updatedAt } : prev)
-              setAssetDetail(prev => prev ? { ...prev, asset: { ...prev.asset, current_price: latest.price, price_updated_at: updatedAt } } : prev)
-              setAssets(prev => prev.map(item => item.id === selectedAsset.id ? { ...item, current_price: latest.price, price_updated_at: updatedAt } : item))
-            }
-          }
+        const history = data.history || []
+        if (history.length > 0) {
+          setAssetDetail(prev => prev ? { ...prev, history } : prev)
+          fillDetailPriceFromHistory(selectedAsset.id, history, { force: realtimeAsset })
         }
       })
       .catch(() => {})
@@ -590,7 +650,7 @@ export default function Assets() {
       }, 600)
     }
     return () => { active = false }
-  }, [detailPeriod, detailOpen, selectedAsset?.id, assetDetail?.asset.id, detailFullHistory.length])
+  }, [detailPeriod, detailOpen, selectedAsset?.id, assetDetail?.asset.id, detailFullHistory.length, fillDetailPriceFromHistory])
 
   useEffect(() => {
     if (!detailOpen || !selectedAsset || !assetDetail) return
@@ -691,6 +751,7 @@ export default function Assets() {
       }, () => analysisApi.agentRun({
         asset_ids: [asset.id],
         goal: `请针对 ${asset.name || asset.code} 这一项资产生成详细分析报告，覆盖基本面、技术面交易策略、具体交易建议、宏观信息和微观信息。`,
+        save_portfolio_record: false,
       }))
       aiCtx.updateSubTask('ai', { status: 'completed', progress: 100, thinking: 'AI 分析完成' })
       aiCtx.addLog('✅ AI 分析报告已更新', 'success', 'AI')
@@ -753,7 +814,22 @@ export default function Assets() {
       render: (_: any, r: Asset) => {
         if (r.current_price == null || r.current_price <= 0) return <span style={{ color: '#5c5a55' }}>-</span>
         const mv = r.shares * r.current_price
-        return <span style={{ fontWeight: 500, color: '#e8e6e3' }}>¥{mv.toFixed(2)}</span>
+        return (
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            minWidth: 92,
+            padding: '4px 8px',
+            borderRadius: 8,
+            background: 'rgba(201, 168, 76, 0.1)',
+            border: '1px solid rgba(201, 168, 76, 0.18)',
+            boxShadow: 'inset 0 0 12px rgba(201, 168, 76, 0.04)',
+          }}>
+            <span style={{ color: '#f3df99', fontWeight: 700, fontSize: 13, lineHeight: 1.2 }}>
+              ¥{mv.toFixed(2)}
+            </span>
+          </div>
+        )
       },
     },
     {
@@ -1018,10 +1094,14 @@ export default function Assets() {
         const s = parsed.final_suggestion
         const color = suggestionColor(s)
         const reportSections = [
+          { title: '仓位诊断', value: parsed.position_diagnosis },
           { title: '宏观影响', value: parsed.macro_impact },
           { title: '微观因素', value: parsed.micro_factors },
           { title: '基本面分析', value: parsed.fundamentals_analysis },
+          { title: '估值判断', value: parsed.valuation_analysis },
           { title: '技术面走势', value: parsed.technical_analysis },
+          { title: '行动计划', value: parsed.action_plan },
+          { title: '观察重点', value: parsed.watch_points },
           { title: '风险提示', value: parsed.risk_warning },
           { title: '数据质量', value: parsed.data_quality },
         ].filter(item => item.value)
@@ -1045,7 +1125,7 @@ export default function Assets() {
               border: '1px solid rgba(201, 168, 76, 0.12)',
               color: '#cfcac1', fontSize: 13, lineHeight: 1.7,
             }}>
-              {parsed.suggested_action || '暂无详细分析'}
+              {parsed.suggested_action || parsed.action_plan || '暂无详细分析'}
             </div>
 
             {reportSections.length > 0 ? (

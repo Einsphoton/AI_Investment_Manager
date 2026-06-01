@@ -121,7 +121,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
 总盈亏：{total_pnl:.2f}
 
 请返回 JSON：
-{{"summary": "一句话总结", "detail": "详细分析报告"}}"""
+{{"summary": "一句话总结", "detail": "Markdown 格式的详细分析报告，使用 ##/### 标题、项目符号、Markdown 表格和 **重点加粗**，不要返回 HTML"}}"""
 
     # Stage 4: Call OpenAI with streaming
     yield sse_event("log", {"message": "正在调用 AI 模型进行分析...", "tag": "AI"})

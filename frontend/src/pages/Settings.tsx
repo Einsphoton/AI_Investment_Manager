@@ -91,6 +91,7 @@ export default function Settings() {
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [importFileName, setImportFileName] = useState('')
   const [importLoading, setImportLoading] = useState(false)
+  const [backupIncludeSettings, setBackupIncludeSettings] = useState(true)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [clearModalOpen, setClearModalOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
@@ -302,7 +303,7 @@ export default function Settings() {
 
   const handleExport = async () => {
     try {
-      await backupApi.download()
+      await backupApi.download(backupIncludeSettings)
       message.success('备份文件已下载')
     } catch (e) {
       message.error('导出失败')
@@ -1110,17 +1111,25 @@ export default function Settings() {
               }}>
                 <Space direction="vertical" size={2}>
                   <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>下载备份</Text>
-                  <Text style={{ color: '#5c5a55', fontSize: 12 }}>导出资产数据和设置到 JSON 文件</Text>
+                  <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                    {backupIncludeSettings ? '导出资产数据和设置到 JSON 文件' : '仅导出资产数据到 JSON 文件'}
+                  </Text>
                 </Space>
-                <Button
-                  type="primary"
-                  icon={<DownloadOutlined />}
-                  onClick={handleExport}
-                  style={{ borderRadius: 10, fontWeight: 500 }}
-                  ghost
-                >
-                  下载备份
-                </Button>
+                <Space size="middle" wrap style={{ justifyContent: 'flex-end' }}>
+                  <Space size={8}>
+                    <Text style={{ color: '#9a9892', fontSize: 12 }}>包含设置页面</Text>
+                    <Switch checked={backupIncludeSettings} onChange={setBackupIncludeSettings} size="small" />
+                  </Space>
+                  <Button
+                    type="primary"
+                    icon={<DownloadOutlined />}
+                    onClick={handleExport}
+                    style={{ borderRadius: 10, fontWeight: 500 }}
+                    ghost
+                  >
+                    下载备份
+                  </Button>
+                </Space>
               </div>
               <div style={{
                 display: 'flex',

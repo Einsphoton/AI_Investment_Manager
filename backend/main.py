@@ -1738,13 +1738,12 @@ def batch_create_assets(data: AssetsBatchCreate, db: Session = Depends(get_db)):
     return created
 
 
-@app.post("/api/backup/export")
-def export_backup(db: Session = Depends(get_db)):
+def _build_backup_payload(db: Session, include_settings: bool = True) -> dict:
     assets = db.query(Asset).all()
-    settings = db.query(Settings).all()
     backup = {
         "version": "1.0",
         "exported_at": datetime.utcnow().isoformat(),
+        "include_settings": include_settings,
         "assets": [
             {
                 "asset_type": a.asset_type,
@@ -1761,9 +1760,16 @@ def export_backup(db: Session = Depends(get_db)):
             }
             for a in assets
         ],
-        "settings": {s.key: s.value for s in settings},
     }
+    if include_settings:
+        settings = db.query(Settings).all()
+        backup["settings"] = {s.key: s.value for s in settings}
     return backup
+
+
+@app.post("/api/backup/export")
+def export_backup(include_settings: bool = Query(True), db: Session = Depends(get_db)):
+    return _build_backup_payload(db, include_settings)
 
 
 @app.post("/api/backup/import")
@@ -1783,34 +1789,14 @@ def import_backup(data: dict, db: Session = Depends(get_db)):
 
 
 @app.post("/api/backup/download")
-def download_backup(db: Session = Depends(get_db)):
-    assets = db.query(Asset).all()
-    settings = db.query(Settings).all()
-    backup = {
-        "version": "1.0",
-        "exported_at": datetime.utcnow().isoformat(),
-        "assets": [
-            {
-                "asset_type": a.asset_type,
-                "market": a.market,
-                "platform": a.platform,
-                "code": a.code,
-                "name": a.name,
-                "shares": a.shares,
-                "buy_price": a.buy_price,
-                "buy_date": a.buy_date,
-                "current_price": a.current_price,
-                "note": a.note,
-            }
-            for a in assets
-        ],
-        "settings": {s.key: s.value for s in settings},
-    }
+def download_backup(include_settings: bool = Query(True), db: Session = Depends(get_db)):
+    backup = _build_backup_payload(db, include_settings)
     json_str = json.dumps(backup, ensure_ascii=False, indent=2)
+    filename = f"investment_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     return StreamingResponse(
         iter([json_str]),
         media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=investment_backup.json"},
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 

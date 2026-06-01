@@ -311,13 +311,18 @@ export const settingsApiFull = {
 }
 
 export const backupApi = {
-  export: () => api.post('/backup/export').then(r => r.data),
+  export: (includeSettings = true) => api.post('/backup/export', {}, { params: { include_settings: includeSettings } }).then(r => r.data),
   import: (data: any) => api.post('/backup/import', data).then(r => r.data),
-  download: () => api.post('/backup/download', {}, { responseType: 'blob' }).then(r => {
+  download: (includeSettings = true) => api.post('/backup/download', {}, {
+    params: { include_settings: includeSettings },
+    responseType: 'blob',
+  }).then(r => {
     const url = URL.createObjectURL(r.data)
     const a = document.createElement('a')
+    const disposition = r.headers['content-disposition'] || ''
+    const match = disposition.match(/filename="?([^"]+)"?/)
     a.href = url
-    a.download = 'investment_backup.json'
+    a.download = match?.[1] || `investment_backup_${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.json`
     a.click()
     URL.revokeObjectURL(url)
   }),

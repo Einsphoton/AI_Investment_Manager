@@ -375,7 +375,14 @@ export default function Dashboard() {
           subtaskIds.push(t.id)
         }
         await new Promise(r => setTimeout(r, 200))
-        await Promise.all(tasks.map(t => t.run()))
+        const adviceTask = tasks.find(t => t.id === 'advice')
+        const hasTargetTask = tasks.some(t => t.id === 'targets')
+        if (adviceTask && hasTargetTask) {
+          await Promise.all(tasks.filter(t => t.id !== 'advice').map(t => t.run()))
+          await adviceTask.run()
+        } else {
+          await Promise.all(tasks.map(t => t.run()))
+        }
         // Complete task early so overlay shows completion immediately
         aiCtx.completeTask()
         // Then fetch fresh data in background

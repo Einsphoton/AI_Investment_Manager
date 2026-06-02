@@ -223,147 +223,42 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
 
 
 def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: list[str] = None) -> Generator[str, None, None]:
-    """SSE generator for target AI analysis with real streaming."""
+    """SSE generator for target AI analysis and recommendation persistence."""
     api_key = get_setting(db, "openai_api_key")
     if not api_key:
         yield sse_event("error", {"detail": "请先配置 OpenAI API Key"})
         return
 
-    from ai_service import normalize_openai_base_url
-    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
-    model = get_setting(db, "openai_model") or "gpt-4o-mini"
-    personality = get_setting(db, "ai_personality") or "balanced"
-    report_style = get_setting(db, "ai_report_style") or "professional"
-    system_prompt = build_system_prompt(personality, report_style)
-    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object
-    runtime_summary = openai_runtime_summary(api_key, base_url, model)
-    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
-
-    yield sse_event("log", {"message": "正在加载标的列表...", "tag": "标的"})
-    targets = db.query(Target).filter(Target.status == "active").all()
-
-    if markets:
-        targets = [t for t in targets if t.market in markets]
-    if asset_types:
-        targets = [t for t in targets if t.asset_type in asset_types]
-
-    yield sse_event("log", {"message": f"已加载 {len(targets)} 个活跃标的", "tag": "标的"})
-    yield sse_event("progress", {"progress": 10})
-
-    if not targets:
-        yield sse_event("complete", {"summary": "暂无活跃标的"})
-        return
-
-    # Fetch quotes for all targets in parallel
-    yield sse_event("thinking", {"message": "正在并行获取标的最新行情..."})
-    from data_source import get_quote
-    from main import _read_providers
-    from parallel_executor import parallel_map
-    providers = _read_providers(db)
-
-    target_data = []
-    for t in targets:
-        item = {
-            "code": t.code, "name": t.name, "market": t.market,
-            "asset_type": t.asset_type, "source": t.source,
-            "priority": t.priority, "risk_level": t.risk_level,
-            "reason": t.reason or "",
-        }
-        target_data.append(item)
-
-    if target_data:
-        def fetch_quote(item):
-            try:
-                quote = get_quote(item["code"].strip().upper(), item["market"], item["asset_type"], providers)
-                if quote:
-                    item["current_price"] = quote.get("current_price")
-                    item["change_pct"] = quote.get("change_pct")
-            except Exception:
-                pass
-            return item
-
-        results = parallel_map(fetch_quote, target_data, max_workers=5, timeout=15)
-        target_data = list(results)
-
-    yield sse_event("progress", {"progress": 28})
-    yield sse_event("log", {"message": f"已获取 {len(targets)} 个标的行情", "tag": "标的"})
-    yield sse_event("thinking", {"message": "AI 正在分析标的..."})
-    yield sse_event("progress", {"progress": 32})
-
-    # Build prompt
-    prompt = f"""{system_prompt}
-
-请对以下投资标的进行深度分析，给出关注理由和操作建议。
-
-标的列表：
-{json.dumps(target_data, ensure_ascii=False, indent=2)[:8000]}
-
-请返回 JSON：
-{{
-  "summary": "总体分析结论",
-  "targets": [
-    {{
-      "code": "代码",
-      "name": "名称",
-      "analysis": "分析结论",
-      "suggestion": "买入/卖出/持有",
-      "confidence": "高/中/低"
-    }}
-  ]
-}}"""
-
-    yield sse_event("log", {"message": "正在调用 AI 模型分析标的...", "tag": "AI"})
-    yield sse_event("progress", {"progress": 35})
-
     try:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-        )
+        from main import ai_analyze_targets
+        from schemas import AIRecommendConfig
 
-        collected = ""
-        token_count = 0
-        for chunk in response:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                collected += delta.content
-                token_count += 1
-                if token_count % 20 == 0:
-                    preview = collected[-80:].replace('\n', ' ') if len(collected) > 80 else collected.replace('\n', ' ')
-                    yield sse_event("thinking", {"message": f"AI 正在分析标的... {preview}"})
-                    p = 30 + min(62, token_count * 0.5)
-                    yield sse_event("progress", {"progress": round(p, 1)})
+        yield sse_event("log", {"message": "正在读取推荐范围与已有标的...", "tag": "标的"})
+        yield sse_event("progress", {"progress": 10})
+        yield sse_event("thinking", {"message": "AI 正在分析现有标的并生成新推荐..."})
+        yield sse_event("log", {"message": "正在调用 AI 标的推荐引擎...", "tag": "AI"})
+        yield sse_event("progress", {"progress": 35})
 
-        if not collected.strip():
-            yield sse_event("log", {"message": "流式响应内容为空，正在改用非流式请求重试...", "tag": "AI"})
-            collected = _retry_non_stream_text(client, model, messages)
+        req = AIRecommendConfig(markets=markets or [], asset_types=asset_types or []) if markets or asset_types else None
+        response = ai_analyze_targets(req=req, db=db)
+        payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+        report = payload.get("report") or {}
+        target_analysis = report.get("target_analysis") or {}
+        new_count = len(target_analysis.get("new_recommendations") or [])
+        existing_count = len(target_analysis.get("existing_targets_analysis") or [])
 
-        try:
-            result = parse_ai_json_object(collected)
-        except Exception:
-            result = {
-                "summary": "AI 返回了非 JSON 标的分析",
-                "targets": [],
-                "raw": (collected or "").strip(),
-            }
-
-        # Update targets with AI analysis
-        for t in targets:
-            t.ai_analysis = json.dumps(result, ensure_ascii=False)
-            t.last_analyzed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        db.commit()
-
-        yield sse_event("log", {"message": "✅ 标的分析完成，结果已保存", "tag": "AI"})
+        yield sse_event("log", {"message": f"✅ 标的分析完成，新增 {new_count} 个推荐，更新 {existing_count} 个已有标的", "tag": "AI"})
         yield sse_event("progress", {"progress": 100})
-        yield sse_event("complete", result)
+        yield sse_event("complete", {
+            "summary": payload.get("summary") or "标的分析完成",
+            "report": report,
+            "new_recommendations": target_analysis.get("new_recommendations") or [],
+            "existing_targets_analysis": target_analysis.get("existing_targets_analysis") or [],
+        })
 
     except Exception as e:
-        yield sse_event("error", {"detail": f"标的分析失败: {openai_error_detail(e, runtime_summary)}"})
+        detail = getattr(e, "detail", None) or str(e)
+        yield sse_event("error", {"detail": f"标的分析失败: {detail}"})
 
 
 def stream_investment_advice(db: Session) -> Generator[str, None, None]:

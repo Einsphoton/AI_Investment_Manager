@@ -67,7 +67,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     system_prompt = build_system_prompt(personality, report_style)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     from ai_service import (
-        openai_error_detail, openai_runtime_summary, parse_ai_json_object,
+        coerce_ai_report_fields, openai_error_detail, openai_runtime_summary, parse_ai_json_object,
         sanitize_ai_payload, strip_model_thinking, text_report_fallback,
     )
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
@@ -197,8 +197,8 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
             yield sse_event("log", {"message": "模型返回内容不是严格 JSON，已按文本报告保存", "tag": "AI"})
             result = text_report_fallback(collected_clean, "AI 返回了非 JSON 报告")
         result = sanitize_ai_payload(result)
-        summary = strip_model_thinking(result.get("summary", "分析完成"))
-        detail = strip_model_thinking(result.get("detail", ""))
+        summary, detail = coerce_ai_report_fields(result.get("summary", "分析完成"), result.get("detail", ""))
+        summary = summary or "分析完成"
 
         # Save to DB
         record = AnalysisRecord(

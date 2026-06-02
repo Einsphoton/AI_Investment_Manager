@@ -45,6 +45,7 @@ from ai_service import (
     safe_key_fingerprint,
     normalize_openai_base_url,
     parse_ai_json_object,
+    coerce_ai_report_fields,
     sanitize_ai_payload,
     strip_model_thinking,
 )
@@ -523,8 +524,9 @@ def _asset_analysis_data(asset: Asset) -> dict:
 
 
 def _analysis_record_response(record: AnalysisRecord) -> dict:
-    summary = strip_model_thinking(record.summary or "") or "AI 分析完成"
-    detail = strip_model_thinking(record.detail or "") or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。"
+    summary, detail = coerce_ai_report_fields(record.summary or "", record.detail or "")
+    summary = summary or "AI 分析完成"
+    detail = detail or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。"
     return {
         "id": record.id,
         "summary": summary,
@@ -1405,15 +1407,15 @@ def get_asset_detail(asset_id: int, db: Session = Depends(get_db)):
         .all()
     )
     latest_record = _find_latest_asset_analysis(db, asset)
-    latest_analysis = (
-        AssetAnalysisSnippet(
+    latest_analysis = None
+    if latest_record:
+        latest_summary, latest_detail = coerce_ai_report_fields(latest_record.summary or "", latest_record.detail or "")
+        latest_analysis = AssetAnalysisSnippet(
             id=latest_record.id,
-            summary=strip_model_thinking(latest_record.summary or "") or "AI 资产分析完成",
-            detail=strip_model_thinking(latest_record.detail or "") or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。",
+            summary=latest_summary or "AI 资产分析完成",
+            detail=latest_detail or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。",
             created_at=latest_record.created_at,
         )
-        if latest_record else None
-    )
 
     return AssetDetailResponse(
         asset=asset,

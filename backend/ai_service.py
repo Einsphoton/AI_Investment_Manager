@@ -134,6 +134,29 @@ def sanitize_ai_payload(value):
     return value
 
 
+def coerce_ai_report_fields(summary: str, detail: str = "") -> tuple[str, str]:
+    """Unwrap reports that were saved as a fenced/full JSON blob."""
+    cleaned_summary = strip_model_thinking(summary or "")
+    cleaned_detail = strip_model_thinking(detail or "")
+
+    for candidate in (cleaned_summary, cleaned_detail):
+        if not candidate or ("{" not in candidate and "```" not in candidate):
+            continue
+        try:
+            parsed = sanitize_ai_payload(parse_ai_json_object(candidate))
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+
+        nested_summary = strip_model_thinking(parsed.get("summary") or "")
+        nested_detail = strip_model_thinking(parsed.get("detail") or "")
+        if nested_summary or nested_detail:
+            return nested_summary or cleaned_summary, nested_detail or cleaned_detail
+
+    return cleaned_summary, cleaned_detail
+
+
 def parse_ai_json_object(content: str) -> dict:
     text = strip_model_thinking(content)
     if not text:
@@ -255,8 +278,8 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
         except Exception:
             result = text_report_fallback(content, "AI 返回了非 JSON 报告")
         result = sanitize_ai_payload(result)
-        summary = strip_model_thinking(result.get("summary", "分析完成"))
-        detail = strip_model_thinking(result.get("detail", ""))
+        summary, detail = coerce_ai_report_fields(result.get("summary", "分析完成"), result.get("detail", ""))
+        summary = summary or "分析完成"
     except Exception as e:
         runtime = openai_runtime_summary(api_key, base_url, model)
         raise HTTPException(status_code=502, detail=f"AI 分析失败: {openai_error_detail(e, runtime)}")

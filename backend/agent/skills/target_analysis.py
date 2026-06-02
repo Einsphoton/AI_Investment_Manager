@@ -103,7 +103,12 @@ class TargetAnalysisSkill(Skill):
     }}
   ],
   "market_insight": "当前市场环境下标的配置建议（100字内）"
-}}"""
+}}
+
+重要约束：
+- 所有用户可见内容必须使用中文。
+- 不要输出英文推理、内部思考过程、<think> 标签或 reasoning 内容。
+- 最终回复只能是 JSON 对象，不要在 JSON 前后添加任何解释。"""
 
         try:
             resp = ctx.client.chat.completions.create(

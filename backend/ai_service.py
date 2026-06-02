@@ -76,8 +76,66 @@ def openai_error_detail(exc: Exception, runtime_summary: str) -> str:
     return f"{message}{hint}；当前使用配置：{runtime_summary}"
 
 
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_TAG_RE = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_REASONING_HINT_RE = re.compile(
+    r"\b(the user|user wants|let me|we need|portfolio overview|mutual funds?|etfs?|"
+    r"analy[sz]e|analysis|thinking|reasoning)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_model_thinking(content: str) -> str:
+    """Remove model reasoning tags and obvious leading chain-of-thought prose."""
+    text = str(content or "")
+    if not text:
+        return ""
+    lower_text = text.lower()
+    has_unclosed_think = "<think" in lower_text and "</think" not in lower_text
+
+    for _ in range(4):
+        cleaned = _THINK_BLOCK_RE.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    text = _THINK_TAG_RE.sub("", text)
+    text = text.lstrip()
+    if has_unclosed_think and _REASONING_HINT_RE.search(text[:1000]):
+        answer_marker = re.search(r"(?:^|\n)#{1,4}\s*[\u4e00-\u9fff]", text)
+        if answer_marker:
+            text = text[answer_marker.start():].lstrip()
+        else:
+            return ""
+    if text.startswith(("{", "[")):
+        return text.strip()
+
+    lines = text.splitlines()
+    while lines and not _CJK_RE.search(lines[0]) and _REASONING_HINT_RE.search(lines[0]):
+        lines.pop(0)
+    text = "\n".join(lines).lstrip()
+
+    first_cjk = _CJK_RE.search(text)
+    if first_cjk and first_cjk.start() > 20:
+        prefix = text[:first_cjk.start()]
+        if _REASONING_HINT_RE.search(prefix):
+            text = text[first_cjk.start():].lstrip()
+
+    return text.strip()
+
+
+def sanitize_ai_payload(value):
+    if isinstance(value, str):
+        return strip_model_thinking(value)
+    if isinstance(value, list):
+        return [sanitize_ai_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: sanitize_ai_payload(item) for key, item in value.items()}
+    return value
+
+
 def parse_ai_json_object(content: str) -> dict:
-    text = (content or "").strip()
+    text = strip_model_thinking(content)
     if not text:
         raise ValueError("模型返回空内容")
 
@@ -100,7 +158,7 @@ def parse_ai_json_object(content: str) -> dict:
 
 
 def text_report_fallback(content: str, default_summary: str = "AI 分析完成") -> dict:
-    text = (content or "").strip()
+    text = strip_model_thinking(content)
     if not text:
         text = "模型未返回可解析内容。请检查当前模型是否支持 Chat Completions、streaming，以及是否会按提示返回 JSON。"
     first_line = next((line.strip("#* -") for line in text.splitlines() if line.strip()), "")
@@ -174,7 +232,12 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
 {{
   "summary": "一句话总结（50字以内）",
   "detail": "Markdown 格式的详细分析报告（使用 ##/### 标题、项目符号、Markdown 表格和 **重点加粗**；包括市场回顾、各资产表现（引用真实PE/PB）、风险提示和操作建议，200-500字）"
-}}"""
+}}
+
+重要约束：
+- 所有用户可见内容必须使用中文。
+- 不要输出英文推理、内部思考过程、<think> 标签或 reasoning 内容。
+- 最终回复只能是 JSON 对象，不要在 JSON 前后添加任何解释。"""
 
     client = OpenAI(api_key=api_key, base_url=base_url or None)
     try:
@@ -191,8 +254,9 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
             result = parse_ai_json_object(content)
         except Exception:
             result = text_report_fallback(content, "AI 返回了非 JSON 报告")
-        summary = result.get("summary", "分析完成")
-        detail = result.get("detail", "")
+        result = sanitize_ai_payload(result)
+        summary = strip_model_thinking(result.get("summary", "分析完成"))
+        detail = strip_model_thinking(result.get("detail", ""))
     except Exception as e:
         runtime = openai_runtime_summary(api_key, base_url, model)
         raise HTTPException(status_code=502, detail=f"AI 分析失败: {openai_error_detail(e, runtime)}")

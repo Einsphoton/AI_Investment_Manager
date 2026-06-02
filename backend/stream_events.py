@@ -66,7 +66,10 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     report_style = get_setting(db, "ai_report_style") or "professional"
     system_prompt = build_system_prompt(personality, report_style)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
-    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object, text_report_fallback
+    from ai_service import (
+        openai_error_detail, openai_runtime_summary, parse_ai_json_object,
+        sanitize_ai_payload, strip_model_thinking, text_report_fallback,
+    )
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
 
     # Stage 1: Load assets (slow start)
@@ -140,7 +143,12 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
 总盈亏：{total_pnl:.2f}
 
 请返回 JSON：
-{{"summary": "一句话总结", "detail": "Markdown 格式的详细分析报告，使用 ##/### 标题、项目符号、Markdown 表格和 **重点加粗**，不要返回 HTML"}}"""
+{{"summary": "一句话总结", "detail": "Markdown 格式的详细分析报告，使用 ##/### 标题、项目符号、Markdown 表格和 **重点加粗**，不要返回 HTML"}}
+
+重要约束：
+- 所有用户可见内容必须使用中文。
+- 不要输出英文推理、内部思考过程、<think> 标签或 reasoning 内容。
+- 最终回复只能是 JSON 对象，不要在 JSON 前后添加任何解释。"""
 
     # Stage 4: Call OpenAI with streaming
     yield sse_event("log", {"message": "正在调用 AI 模型进行分析...", "tag": "AI"})
@@ -169,6 +177,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
                 if token_count % 20 == 0:
                     # Show real AI content every 20 tokens
                     preview = collected[-80:].replace('\n', ' ') if len(collected) > 80 else collected.replace('\n', ' ')
+                    preview = strip_model_thinking(preview) or "AI 正在生成报告..."
                     yield sse_event("thinking", {"message": f"AI 正在生成报告... {preview}"})
                     p = 30 + min(62, token_count * 0.5)
                     yield sse_event("progress", {"progress": round(p, 1)})
@@ -181,14 +190,15 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
         yield sse_event("log", {"message": "AI 响应完成，正在解析结果...", "tag": "AI"})
         yield sse_event("progress", {"progress": 95})
 
-        collected_clean = collected.strip()
+        collected_clean = strip_model_thinking(collected)
         try:
             result = parse_ai_json_object(collected_clean)
         except Exception:
             yield sse_event("log", {"message": "模型返回内容不是严格 JSON，已按文本报告保存", "tag": "AI"})
             result = text_report_fallback(collected_clean, "AI 返回了非 JSON 报告")
-        summary = result.get("summary", "分析完成")
-        detail = result.get("detail", "")
+        result = sanitize_ai_payload(result)
+        summary = strip_model_thinking(result.get("summary", "分析完成"))
+        detail = strip_model_thinking(result.get("detail", ""))
 
         # Save to DB
         record = AnalysisRecord(
@@ -307,7 +317,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
     yield sse_event("thinking", {"message": "AI 正在分析投资策略..."})
     yield sse_event("progress", {"progress": 25})
 
-    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object
+    from ai_service import openai_error_detail, openai_runtime_summary, parse_ai_json_object, sanitize_ai_payload, strip_model_thinking
     runtime_summary = openai_runtime_summary(api_key, base_url, model)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     prompt, market_snapshot = _build_investment_advice_prompt(
@@ -339,6 +349,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
                 token_count += 1
                 if token_count % 20 == 0:
                     preview = collected[-80:].replace('\n', ' ') if len(collected) > 80 else collected.replace('\n', ' ')
+                    preview = strip_model_thinking(preview) or "AI 正在生成建议..."
                     yield sse_event("thinking", {"message": f"AI 正在生成建议... {preview}"})
                     p = 25 + min(67, token_count * 0.5)
                     yield sse_event("progress", {"progress": round(p, 1)})
@@ -349,6 +360,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
 
         try:
             raw = parse_ai_json_object(collected)
+            raw = sanitize_ai_payload(raw)
         except Exception:
             raw = {
                 "summary": "AI 返回了非 JSON 投资建议",

@@ -44,6 +44,9 @@ from ai_service import (
     set_setting,
     safe_key_fingerprint,
     normalize_openai_base_url,
+    parse_ai_json_object,
+    sanitize_ai_payload,
+    strip_model_thinking,
 )
 from data_source import lookup_name, get_quote, get_history, get_fundamentals, search, PROVIDER_LABELS, STOCK_PROVIDER_OPTIONS, FUND_PROVIDER_OPTIONS
 from ocr_service import parse_image
@@ -461,7 +464,7 @@ def get_dashboard(db: Session = Depends(get_db)):
         total_pnl_percent=round(total_pnl_percent, 2),
         realized_pnl=round(realized, 2),
         assets_count=len(assets),
-        analysis_summary=latest_analysis.summary if latest_analysis else "暂无分析报告",
+        analysis_summary=strip_model_thinking(latest_analysis.summary) if latest_analysis else "暂无分析报告",
     )
 
 
@@ -516,6 +519,22 @@ def _asset_analysis_data(asset: Asset) -> dict:
         "total_cost": total_cost,
         "total_pnl": total_pnl,
         "total_pnl_percent": (total_pnl / total_cost * 100) if total_cost else 0,
+    }
+
+
+def _analysis_record_response(record: AnalysisRecord) -> dict:
+    summary = strip_model_thinking(record.summary or "") or "AI 分析完成"
+    detail = strip_model_thinking(record.detail or "") or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。"
+    return {
+        "id": record.id,
+        "summary": summary,
+        "detail": detail,
+        "total_market_value": record.total_market_value or 0,
+        "total_cost": record.total_cost or 0,
+        "total_pnl": record.total_pnl or 0,
+        "total_pnl_percent": record.total_pnl_percent or 0,
+        "realized_pnl": record.realized_pnl or 0,
+        "created_at": record.created_at,
     }
 
 
@@ -619,6 +638,7 @@ def _fallback_asset_recommendation(asset: dict, reason: str = "") -> dict:
 def _normalize_asset_ai_report(raw: dict, asset_data: list[dict]) -> dict:
     if not isinstance(raw, dict):
         raw = {}
+    raw = sanitize_ai_payload(raw)
 
     by_code = {_analysis_code_key(a["code"]): a for a in asset_data}
     by_name = {a["name"]: a for a in asset_data}
@@ -655,7 +675,7 @@ def _normalize_asset_ai_report(raw: dict, asset_data: list[dict]) -> dict:
         overall = {"overall_strategy": str(overall)}
 
     summary = raw.get("summary") or overall.get("overall_strategy") or "AI 分析完成"
-    return {
+    return sanitize_ai_payload({
         "goal": raw.get("goal", ""),
         "macro_analysis": raw.get("macro_analysis", {}),
         "asset_analyses": normalized_items,
@@ -664,7 +684,7 @@ def _normalize_asset_ai_report(raw: dict, asset_data: list[dict]) -> dict:
             "overall_strategy": overall,
         },
         "summary": summary,
-    }
+    })
 
 
 def _run_compact_asset_ai_analysis(
@@ -744,7 +764,12 @@ def _run_compact_asset_ai_analysis(
     "key_focus": "后续重点关注",
     "market_outlook": "市场展望"
   }}
-}}"""
+}}
+
+重要约束：
+- 所有用户可见内容必须使用中文。
+- 不要输出英文推理、内部思考过程、<think> 标签或 reasoning 内容。
+- 最终回复只能是 JSON 对象，不要在 JSON 前后添加任何解释。"""
 
     try:
         resp = client.chat.completions.create(
@@ -755,7 +780,8 @@ def _run_compact_asset_ai_analysis(
             ],
             response_format={"type": "json_object"},
         )
-        raw = json.loads(resp.choices[0].message.content)
+        raw = parse_ai_json_object(resp.choices[0].message.content)
+        raw = sanitize_ai_payload(raw)
     except Exception as e:
         raw = {
             "summary": "AI 分析暂不可用，已生成基于持仓数据的保守报告。",
@@ -1086,7 +1112,12 @@ def _build_investment_advice_prompt(
       "risk_note": "主要风险"
     }}
   ]
-}}"""
+}}
+
+重要约束：
+- 所有用户可见内容必须使用中文。
+- 不要输出英文推理、内部思考过程、<think> 标签或 reasoning 内容。
+- 最终回复只能是 JSON 对象，不要在 JSON 前后添加任何解释。"""
     return prompt, market_snapshot
 
 
@@ -1242,6 +1273,7 @@ def _normalize_investment_advice(
 ) -> dict:
     if not isinstance(raw, dict):
         raw = {}
+    raw = sanitize_ai_payload(raw)
     raw_items = raw.get("advice") or raw.get("recommendations") or []
     if not isinstance(raw_items, list):
         raw_items = []
@@ -1279,7 +1311,7 @@ def _normalize_investment_advice(
         if not passes_gate:
             print(f"[InvestmentAdvice:drop] {code or '<empty>'}: {gate_reason}")
             continue
-        name = item.get("name") or item.get("asset_name") or (existing_asset.name if existing_asset else candidate.get("name")) or code
+        name = strip_model_thinking(item.get("name") or item.get("asset_name") or (existing_asset.name if existing_asset else candidate.get("name")) or code)
         platform = str(item.get("platform") or "").strip()
         budget = _find_budget(budget_status, item.get("budget_id"), platform, market, asset_type)
         if not budget:
@@ -1330,25 +1362,25 @@ def _normalize_investment_advice(
             "shares": round(shares, 4),
             "price": round(price, 4),
             "estimated_amount": round(estimated, 2),
-            "reason": str(item.get("reason") or item.get("suggested_action") or "AI 建议").strip(),
-            "evidence": [str(v).strip() for v in item.get("evidence", []) if str(v).strip()] if isinstance(item.get("evidence"), list) else [],
+            "reason": strip_model_thinking(item.get("reason") or item.get("suggested_action") or "AI 建议"),
+            "evidence": [strip_model_thinking(v) for v in item.get("evidence", []) if strip_model_thinking(v)] if isinstance(item.get("evidence"), list) else [],
             "confidence_score": int(_normalize_ai_number(item.get("confidence_score"), 50)),
-            "risk_note": str(item.get("risk_note") or item.get("risk_warning") or "").strip(),
+            "risk_note": strip_model_thinking(item.get("risk_note") or item.get("risk_warning") or ""),
             "source": "holding" if existing_asset else "target",
             "asset_id": existing_asset.id if existing_asset else None,
         })
 
-    summary = raw.get("summary") or ("已生成投资建议" if normalized else "暂无符合额度和行情约束的投资建议")
+    summary = strip_model_thinking(raw.get("summary") or ("已生成投资建议" if normalized else "暂无符合额度和行情约束的投资建议"))
     market_context = raw.get("market_context") if isinstance(raw.get("market_context"), dict) else {}
     decision_audit = raw.get("decision_audit") if isinstance(raw.get("decision_audit"), list) else []
-    return {
+    return sanitize_ai_payload({
         "summary": summary,
         "advice": normalized,
         "budget_status": budget_status,
         "market_context": market_context,
         "market_snapshot": market_snapshot,
         "decision_audit": decision_audit,
-    }
+    })
 
 
 def _fallback_investment_advice(budget_status: list[dict], targets: list[dict]) -> dict:
@@ -1373,7 +1405,15 @@ def get_asset_detail(asset_id: int, db: Session = Depends(get_db)):
         .all()
     )
     latest_record = _find_latest_asset_analysis(db, asset)
-    latest_analysis = AssetAnalysisSnippet.model_validate(latest_record) if latest_record else None
+    latest_analysis = (
+        AssetAnalysisSnippet(
+            id=latest_record.id,
+            summary=strip_model_thinking(latest_record.summary or "") or "AI 资产分析完成",
+            detail=strip_model_thinking(latest_record.detail or "") or "该分析记录包含模型思考过程，已自动隐藏。请重新运行 AI 分析生成新的中文报告。",
+            created_at=latest_record.created_at,
+        )
+        if latest_record else None
+    )
 
     return AssetDetailResponse(
         asset=asset,
@@ -1663,18 +1703,19 @@ def get_latest_analysis(db: Session = Depends(get_db)):
     record = _latest_successful_analysis(db)
     if not record:
         raise HTTPException(status_code=404, detail="暂无分析记录")
-    return record
+    return _analysis_record_response(record)
 
 
 @app.get("/api/analysis/history", response_model=list[AnalysisResponse])
 def get_analysis_history(db: Session = Depends(get_db)):
-    return (
+    records = (
         db.query(AnalysisRecord)
         .filter(AnalysisRecord.asset_id.is_(None))
         .order_by(AnalysisRecord.created_at.desc())
         .limit(50)
         .all()
     )
+    return [_analysis_record_response(record) for record in records]
 
 
 @app.get("/api/settings/parallel-config")
@@ -2153,6 +2194,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
         market_insight = "标的分析完成"
         try:
             target_result = TargetAnalysisSkill().execute(ctx)
+            target_result = sanitize_ai_payload(target_result)
             market_insight = target_result.get("market_insight") or "标的分析完成"
         except Exception:
             pass
@@ -2468,7 +2510,8 @@ def run_investment_advice(db: Session = Depends(get_db)):
             ],
             response_format={"type": "json_object"},
         )
-        raw = json.loads(resp.choices[0].message.content)
+        raw = parse_ai_json_object(resp.choices[0].message.content)
+        raw = sanitize_ai_payload(raw)
     except Exception as e:
         print(f"[InvestmentAdvice] AI failed: {e}")
         raw = _fallback_investment_advice(budget_status, target_items)

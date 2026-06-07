@@ -1,5 +1,5 @@
-import json
 from ..skill import Skill, SkillContext
+from ai_service import parse_ai_json_object, sanitize_ai_payload
 
 
 def _fmt(v, suffix=""):
@@ -15,10 +15,43 @@ class TargetAnalysisSkill(Skill):
     description = "AI 标的分析与推荐引擎：结合基本面、技术面、宏观微观信息深度分析并推荐标的"
     dependencies = ["macro_analysis"]
 
+    def _normalize_result(self, raw) -> dict:
+        raw = sanitize_ai_payload(raw if isinstance(raw, dict) else {})
+        existing = raw.get("existing_targets_analysis") or raw.get("existing_analysis") or []
+        recommendations = (
+            raw.get("new_recommendations")
+            or raw.get("recommendations")
+            or raw.get("recommended_targets")
+            or raw.get("targets")
+            or []
+        )
+        if isinstance(recommendations, dict):
+            recommendations = (
+                recommendations.get("items")
+                or recommendations.get("targets")
+                or recommendations.get("new_recommendations")
+                or recommendations.get("asset_recommendations")
+                or []
+            )
+        if not isinstance(existing, list):
+            existing = []
+        if not isinstance(recommendations, list):
+            recommendations = []
+        return {
+            **raw,
+            "existing_targets_analysis": existing,
+            "new_recommendations": [item for item in recommendations if isinstance(item, dict)],
+            "market_insight": raw.get("market_insight") or raw.get("summary") or "标的分析完成",
+            "source": "ai",
+        }
+
     def execute(self, ctx: SkillContext) -> dict:
         user_targets = ctx.data.get("target_data", [])
         macro = ctx.data.get("macro_analysis", {})
+        import json
         macro_json = json.dumps(macro, ensure_ascii=False)[:800] if macro else "{}"
+        allowed_markets = ctx.data.get("recommend_markets") or ["A", "HK", "US"]
+        allowed_asset_types = ctx.data.get("recommend_asset_types") or ["stock", "onshore_fund", "offshore_fund"]
 
         # Build a concise fundamental-data table for the AI to reference
         target_table = []
@@ -51,6 +84,9 @@ class TargetAnalysisSkill(Skill):
 以下是用户关注的每个标的的**实时基本面数据**（从数据源直接获取），请基于这些真实数据进行分析，不要编造数字：
 {json.dumps(target_table, ensure_ascii=False, indent=2)}
 
+本次允许推荐的市场：{", ".join(allowed_markets)}
+本次允许推荐的资产类型：{", ".join(allowed_asset_types)}
+
 请执行以下任务：
 
 1. **分析现有标的**：对每个标的进行全面深度评估，判断是否还值得继续关注
@@ -63,6 +99,8 @@ class TargetAnalysisSkill(Skill):
 - 基本面分析部分请明确引用实时数据（如"当前PE为xx倍，PB为xx倍"）
 - 对“推荐新标的”，上表没有实时基本面数据时，不得写具体 PE、PB、股息率、分红率、营收增速、ROE 等数字；只能写“需以后端实时数据验证”或使用不含数字的定性描述。
 - 不得使用训练记忆或常识补全财务数字；缺失字段必须写“暂无实时数据”，不要估算。
+- 推荐新标的时，market 只能使用 A/HK/US；asset_type 只能使用 stock/onshore_fund/offshore_fund。
+- 即使当前关注标的为空，也必须基于宏观环境和允许范围推荐 3-5 个新标的。
 
 返回 JSON 格式（请确保返回的 JSON 严格符合以下结构）：
 {{
@@ -117,11 +155,9 @@ class TargetAnalysisSkill(Skill):
                     {"role": "system", "content": ctx.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
-                response_format={"type": "json_object"},
             )
-            result = json.loads(resp.choices[0].message.content)
-            result["source"] = "ai"
-            return result
+            result = parse_ai_json_object(resp.choices[0].message.content)
+            return self._normalize_result(result)
         except Exception as e:
             return {
                 "existing_targets_analysis": [],

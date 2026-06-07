@@ -654,6 +654,13 @@ export default function Targets() {
         if (result && result.summary) {
           aiCtx.addLog(`✅ ${result.summary}`, 'success')
         }
+        if (result && (result.new_recommendations || []).length === 0) {
+          aiCtx.addLog('⚠️ AI 未生成新标的，详见上方过滤原因', 'warning')
+          message.warning({
+            content: 'AI 标的分析完成但 0 条入库，请打开覆盖层日志或「设置 → AI 推荐」调整过滤范围。',
+            duration: 6,
+          })
+        }
       } catch (e: any) {
         // Fallback
         const result = await targetsApi.aiAnalyze({
@@ -664,6 +671,14 @@ export default function Targets() {
         await fetchRecommendationStats()
         if (result && result.summary) {
           aiCtx.addLog(`✅ ${result.summary}`, 'success')
+        }
+        const fbNew = result?.report?.target_analysis?.new_recommendations || []
+        if (fbNew.length === 0) {
+          aiCtx.addLog('⚠️ AI 未生成新标的，详见上方过滤原因', 'warning')
+          message.warning({
+            content: 'AI 标的分析完成但 0 条入库，请打开覆盖层日志或「设置 → AI 推荐」调整过滤范围。',
+            duration: 6,
+          })
         }
       }
       aiCtx.completeTask()

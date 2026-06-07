@@ -13,6 +13,7 @@ const logTypeStyles: Record<LogEntry['type'], { color: string; icon: string }> =
   thinking: { color: '#c9a84c', icon: '💭' },
   progress: { color: '#c9a84c', icon: '⏳' },
   success: { color: '#3f8600', icon: '✅' },
+  warning: { color: '#d4a017', icon: '⚠️' },
   error: { color: '#cf1322', icon: '❌' },
 }
 

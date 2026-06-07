@@ -313,17 +313,35 @@ export default function Dashboard() {
             id: 'targets', name: '标的分析', icon: '🎯',
             run: async () => {
               aiCtx.updateSubTask('targets', { status: 'running', thinking: '正在通过实时流分析标的...', progress: 5 })
+              let targetDiag: any = null
               try {
                 const result = await aiCtx.streamSSE('/api/targets/ai-analyze-stream')
                 if (result && result.summary) {
                   aiCtx.addLog('✅ AI 标的分析完成', 'success', '标的分析')
+                }
+                if (result && (result.new_recommendations || []).length === 0) {
+                  targetDiag = result.filter_diagnostics || {}
+                  aiCtx.updateSubTask('targets', { status: 'completed', progress: 100, thinking: 'AI 未生成新标的' })
+                  aiCtx.addLog('⚠️ AI 未生成新标的，详见上方过滤原因', 'warning', '标的分析')
+                  message.warning({
+                    content: 'AI 标的分析完成但 0 条入库，请打开覆盖层日志或「设置 → AI 推荐」调整过滤范围。',
+                    duration: 6,
+                  })
                 }
               } catch (e: any) {
                 // User cancelled - skip fallback
                 if (e.isCancelled) throw e
                 console.warn('SSE stream for targets failed, falling back to regular API', e)
                 try {
-                  await targetsApi.aiAnalyze()
+                  const fb = await targetsApi.aiAnalyze()
+                  if (fb && (fb.report?.target_analysis?.new_recommendations || []).length === 0) {
+                    targetDiag = fb.report?.filter_diagnostics || {}
+                    aiCtx.addLog('⚠️ AI 未生成新标的，详见上方过滤原因', 'warning', '标的分析')
+                    message.warning({
+                      content: 'AI 标的分析完成但 0 条入库，请打开覆盖层日志或「设置 → AI 推荐」调整过滤范围。',
+                      duration: 6,
+                    })
+                  }
                 } catch (e2: any) {
                   aiCtx.updateSubTask('targets', { status: 'error', progress: 0, thinking: '分析失败' })
                   aiCtx.addLog('❌ AI 标的分析失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error', '标的分析')
@@ -345,6 +363,14 @@ export default function Dashboard() {
                 if (result && result.summary) {
                   aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
                 }
+                if (result && (result.advice || []).length === 0) {
+                  aiCtx.updateSubTask('advice', { status: 'completed', progress: 100, thinking: 'AI 未生成可执行建议' })
+                  aiCtx.addLog('⚠️ AI 未生成可执行建议，详见上方过滤原因', 'warning', '投资建议')
+                  message.warning({
+                    content: 'AI 投资建议完成但 0 条入库，请打开覆盖层日志或「设置」检查额度/行情。',
+                    duration: 6,
+                  })
+                }
               } catch (e: any) {
                 // User cancelled - skip fallback
                 if (e.isCancelled) throw e
@@ -357,8 +383,16 @@ export default function Dashboard() {
                 }
                 console.warn('SSE stream for advice failed, falling back to regular API', e)
                 try {
-                  await investmentAdviceApi.run()
-                  aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
+                  const fb = await investmentAdviceApi.run()
+                  if (fb && (fb.advice || []).length === 0) {
+                    aiCtx.addLog('⚠️ AI 未生成可执行建议，详见上方过滤原因', 'warning', '投资建议')
+                    message.warning({
+                      content: 'AI 投资建议完成但 0 条入库，请打开覆盖层日志或「设置」检查额度/行情。',
+                      duration: 6,
+                    })
+                  } else {
+                    aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
+                  }
                 } catch (e2: any) {
                   aiCtx.updateSubTask('advice', { status: 'error', progress: 0, thinking: '建议生成失败' })
                   aiCtx.addLog('❌ AI 投资建议失败: ' + (e2?.response?.data?.detail || e2.message || '未知错误'), 'error', '投资建议')

@@ -608,6 +608,55 @@ def _analysis_code_key(code: str) -> str:
     return value
 
 
+def _normalize_target_market(value, fallback="A") -> str:
+    raw = strip_model_thinking(value or "").strip()
+    upper = raw.upper().replace(" ", "")
+    mapping = {
+        "A": "A", "ASHARE": "A", "A-SHARE": "A", "A股": "A", "中国A股": "A", "沪深": "A", "内地": "A",
+        "HK": "HK", "H": "HK", "H股": "HK", "港股": "HK", "香港": "HK",
+        "US": "US", "USA": "US", "U.S.": "US", "美股": "US", "美国": "US",
+    }
+    if upper in mapping:
+        return mapping[upper]
+    if "港" in raw or upper.startswith("HK"):
+        return "HK"
+    if "美" in raw or upper in {"NYSE", "NASDAQ"}:
+        return "US"
+    if "A" in upper or "沪" in raw or "深" in raw or "中" in raw:
+        return "A"
+    return fallback
+
+
+def _normalize_target_asset_type(value, fallback="stock") -> str:
+    raw = strip_model_thinking(value or "").strip()
+    lower = raw.lower().replace(" ", "_").replace("-", "_")
+    mapping = {
+        "stock": "stock", "stocks": "stock", "equity": "stock", "股票": "stock", "个股": "stock",
+        "onshore_fund": "onshore_fund", "etf": "onshore_fund", "场内基金": "onshore_fund", "基金etf": "onshore_fund",
+        "offshore_fund": "offshore_fund", "mutual_fund": "offshore_fund", "场外基金": "offshore_fund", "公募基金": "offshore_fund",
+    }
+    if lower in mapping:
+        return mapping[lower]
+    if "场内" in raw or "ETF" in raw.upper():
+        return "onshore_fund"
+    if "场外" in raw or "公募" in raw or "基金" in raw:
+        return "offshore_fund"
+    if "股" in raw:
+        return "stock"
+    return fallback
+
+
+def _normalize_target_level(value, fallback="MEDIUM") -> str:
+    raw = strip_model_thinking(value or "").strip().upper()
+    if raw in {"HIGH", "MEDIUM", "LOW"}:
+        return raw
+    if "高" in raw or "强" in raw:
+        return "HIGH"
+    if "低" in raw or "弱" in raw:
+        return "LOW"
+    return fallback
+
+
 def _fallback_asset_recommendation(asset: dict, reason: str = "") -> dict:
     current_price = _normalize_ai_number(asset.get("current_price"))
     buy_price = _normalize_ai_number(asset.get("buy_price"))
@@ -780,7 +829,6 @@ def _run_compact_asset_ai_analysis(
                 {"role": "system", "content": ctx.system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            response_format={"type": "json_object"},
         )
         raw = parse_ai_json_object(resp.choices[0].message.content)
         raw = sanitize_ai_payload(raw)
@@ -1272,6 +1320,7 @@ def _normalize_investment_advice(
     targets: list[dict],
     budget_status: list[dict],
     market_snapshot: dict | None = None,
+    diagnostics: list[dict] | None = None,
 ) -> dict:
     if not isinstance(raw, dict):
         raw = {}
@@ -1293,7 +1342,18 @@ def _normalize_investment_advice(
     normalized = []
 
     for idx, item in enumerate(raw_items):
+        def _drop(category: str, reason: str, code_value: str = "", trade_type_value: str = "") -> None:
+            if diagnostics is not None:
+                diagnostics.append({
+                    "code": code_value,
+                    "category": category,
+                    "reason": reason,
+                    "trade_type": trade_type_value or None,
+                })
+            print(f"[InvestmentAdvice:drop] {code_value or '<empty>'}: {category} - {reason}")
+
         if not isinstance(item, dict):
+            _drop("invalid_item", "原始建议不是有效对象", "<index>")
             continue
         trade_type = str(item.get("trade_type") or item.get("action") or "").strip().upper()
         if trade_type in {"BUY", "买入"}:
@@ -1301,6 +1361,7 @@ def _normalize_investment_advice(
         elif trade_type in {"SELL", "卖出"}:
             trade_type = "SELL"
         else:
+            _drop("invalid_trade_type", "trade_type 不是 BUY/SELL", "", str(item.get("trade_type") or ""))
             continue
 
         code = _analysis_code_key(item.get("code") or item.get("asset_code") or "")
@@ -1311,12 +1372,13 @@ def _normalize_investment_advice(
         candidate = targets_by_key.get(key) or {}
         passes_gate, gate_reason = _advice_passes_evidence_gate(item, existing_asset, candidate, market_snapshot)
         if not passes_gate:
-            print(f"[InvestmentAdvice:drop] {code or '<empty>'}: {gate_reason}")
+            _drop("evidence_gate", gate_reason, code, trade_type)
             continue
         name = strip_model_thinking(item.get("name") or item.get("asset_name") or (existing_asset.name if existing_asset else candidate.get("name")) or code)
         platform = str(item.get("platform") or "").strip()
         budget = _find_budget(budget_status, item.get("budget_id"), platform, market, asset_type)
         if not budget:
+            _drop("no_budget", f"找不到匹配的平台额度（platform={platform or 'AI 未填'}）", code, trade_type)
             continue
 
         price = _normalize_ai_number(item.get("price") or item.get("current_price"), 0)
@@ -1326,13 +1388,16 @@ def _normalize_investment_advice(
             price = _normalize_ai_number((candidate.get("quote") or {}).get("current_price"), 0)
         shares = _normalize_ai_number(item.get("shares") or item.get("quantity"), 0)
         if price <= 0 or shares <= 0:
+            _drop("no_price_shares", f"缺少有效价格或份额（price={price}, shares={shares}）", code, trade_type)
             continue
 
         if trade_type == "BUY":
             if not _budget_matches_asset(budget, {"market": market, "asset_type": asset_type}):
+                _drop("budget_mismatch", f"平台 {budget['platform']} 不支持 {market}/{asset_type}", code, trade_type)
                 continue
             available = remaining_by_budget.get(budget["id"], 0)
             if available <= 0:
+                _drop("no_budget_remaining", f"平台 {budget['platform']} 剩余额度为 0", code, trade_type)
                 continue
             max_amount = available * 0.7
             estimated = shares * price
@@ -1340,10 +1405,12 @@ def _normalize_investment_advice(
                 shares = max(0, max_amount / price)
                 estimated = shares * price
             if shares <= 0 or estimated <= 0:
+                _drop("amount_too_small", "建议金额小于 0.7×remaining 阈值", code, trade_type)
                 continue
             remaining_by_budget[budget["id"]] = max(0, available - estimated)
         else:
             if not existing_asset or shares > (existing_asset.shares or 0):
+                _drop("insufficient_shares", f"卖出份额 {shares} 超过持仓 {existing_asset.shares if existing_asset else 0}", code, trade_type)
                 continue
             estimated = shares * price
 
@@ -2181,7 +2248,11 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
         ctx = SkillContext(
             api_key=api_key, base_url=base_url, model=model,
             db_session=db,
-            data={"target_data": target_data},
+            data={
+                "target_data": target_data,
+                "recommend_markets": markets or ["A", "HK", "US"],
+                "recommend_asset_types": asset_types or ["stock", "onshore_fund", "offshore_fund"],
+            },
             personality=personality, report_style=report_style,
         )
         ctx.client = client
@@ -2197,9 +2268,11 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
         try:
             target_result = TargetAnalysisSkill().execute(ctx)
             target_result = sanitize_ai_payload(target_result)
+            if target_result.get("fallback") and not (target_result.get("new_recommendations") or target_result.get("existing_targets_analysis")):
+                raise HTTPException(status_code=502, detail=f"AI 标的分析失败: {target_result.get('error') or '模型未返回可用推荐'}")
             market_insight = target_result.get("market_insight") or "标的分析完成"
         except Exception:
-            pass
+            raise
 
         def safe_str(v, default=""):
             return str(v) if v is not None else default
@@ -2243,28 +2316,62 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
         # Track recommendation stats
         _added_count = 0
         _removed_count = 0
+        _missing_code_count = 0
 
         # Filter new recommendations by AI recommend config
+        filter_diagnostics = {
+            "raw_count": len(target_result.get("new_recommendations") or []),
+            "not_dict_count": 0,
+            "missing_code_count": 0,
+            "filtered_market_count": 0,
+            "filtered_type_count": 0,
+            "added_count": 0,
+            "filter_markets": list(markets),
+            "filter_asset_types": list(asset_types),
+        }
         filtered_recs = []
         for rec in (target_result.get("new_recommendations") or []):
             if not isinstance(rec, dict):
+                filter_diagnostics["not_dict_count"] += 1
                 continue
+            raw_code = safe_str(rec.get("code") or rec.get("symbol") or rec.get("ticker") or rec.get("target_code"))
+            if not raw_code:
+                filter_diagnostics["missing_code_count"] += 1
+                continue
+            rec["code"] = raw_code.strip().upper()
+            rec["name"] = safe_str(rec.get("name") or rec.get("asset_name") or rec.get("target_name") or rec.get("security_name"))
+            fallback_market = markets[0] if markets else "A"
+            fallback_type = asset_types[0] if asset_types else "stock"
+            rec["market"] = _normalize_target_market(rec.get("market"), fallback_market)
+            rec["asset_type"] = _normalize_target_asset_type(rec.get("asset_type"), fallback_type)
+            rec["priority"] = _normalize_target_level(rec.get("priority"), "MEDIUM")
+            rec["risk_level"] = _normalize_target_level(rec.get("risk_level"), "MEDIUM")
             rec_market = rec.get("market", "")
             rec_type = rec.get("asset_type", "")
             if markets and rec_market not in markets:
+                filter_diagnostics["filtered_market_count"] += 1
                 continue
             if asset_types and rec_type not in asset_types:
+                filter_diagnostics["filtered_type_count"] += 1
                 continue
             filtered_recs.append(rec)
         target_result["new_recommendations"] = filtered_recs
+        target_result["filter_diagnostics"] = filter_diagnostics
 
         # Process new recommendations FIRST so removal logic below takes final effect
         for rec in (target_result.get("new_recommendations") or []):
             if not isinstance(rec, dict):
                 continue
+            rec["code"] = safe_str(rec.get("code") or rec.get("symbol") or rec.get("ticker") or rec.get("target_code")).strip().upper()
+            rec["name"] = safe_str(rec.get("name") or rec.get("asset_name") or rec.get("target_name") or rec.get("security_name"))
             code = safe_str(rec.get("code"))
             if not code:
+                _missing_code_count += 1
                 continue
+            rec["market"] = _normalize_target_market(rec.get("market"), markets[0] if markets else "A")
+            rec["asset_type"] = _normalize_target_asset_type(rec.get("asset_type"), asset_types[0] if asset_types else "stock")
+            rec["priority"] = _normalize_target_level(rec.get("priority"), "MEDIUM")
+            rec["risk_level"] = _normalize_target_level(rec.get("risk_level"), "MEDIUM")
             attach_realtime_market_data(rec, safe_str(rec.get("market")) or "A", safe_str(rec.get("asset_type")) or "stock")
             existing = db.query(Target).filter(
                 Target.code == code,
@@ -2282,6 +2389,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                     pass
             else:
                 _added_count += 1
+                filter_diagnostics["added_count"] = _added_count
                 db.add(Target(
                     code=code,
                     name=safe_str(rec.get("name")) or code,
@@ -2324,11 +2432,14 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
         _save_recommendation_snapshot(db, _added_count, _removed_count, market_insight or "标的分析完成")
         db.commit()
 
+        filter_diagnostics["removed_count"] = _removed_count
+        filter_diagnostics["missing_code_count"] = _missing_code_count
         return AgentAnalysisResponse(
             summary=market_insight,
             report={
                 "macro_analysis": ctx.data.get("macro_analysis", {}),
                 "target_analysis": target_result,
+                "filter_diagnostics": filter_diagnostics,
             },
         )
     except HTTPException:
@@ -2510,7 +2621,6 @@ def run_investment_advice(db: Session = Depends(get_db)):
                 {"role": "system", "content": ctx.system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            response_format={"type": "json_object"},
         )
         raw = parse_ai_json_object(resp.choices[0].message.content)
         raw = sanitize_ai_payload(raw)

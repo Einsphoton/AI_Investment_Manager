@@ -3,7 +3,7 @@ import React, { createContext, useContext, useReducer, useCallback, useRef, useE
 export interface LogEntry {
   timestamp: Date
   message: string
-  type: 'info' | 'thinking' | 'progress' | 'success' | 'error'
+  type: 'info' | 'thinking' | 'progress' | 'success' | 'warning' | 'error'
   tag?: string
 }
 
@@ -413,7 +413,7 @@ export function AIWorkProvider({ children }: { children: React.ReactNode }) {
                     entry: {
                       timestamp: new Date(),
                       message: data.message,
-                      type: data.message.startsWith('✅') ? 'success' : 'info',
+                      type: (data.message.startsWith('✅') ? 'success' : data.message.startsWith('⚠️') ? 'warning' : 'info'),
                       tag: data.tag || undefined,
                     },
                   })

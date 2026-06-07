@@ -256,14 +256,61 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
         target_analysis = report.get("target_analysis") or {}
         new_count = len(target_analysis.get("new_recommendations") or [])
         existing_count = len(target_analysis.get("existing_targets_analysis") or [])
+        diag = (target_analysis.get("filter_diagnostics")
+                or report.get("filter_diagnostics")
+                or {})
 
-        yield sse_event("log", {"message": f"✅ 标的分析完成，新增 {new_count} 个推荐，更新 {existing_count} 个已有标的", "tag": "AI"})
+        if new_count == 0:
+            raw_count = int(diag.get("raw_count") or 0)
+            missing_code = int(diag.get("missing_code_count") or 0)
+            filt_market = int(diag.get("filtered_market_count") or 0)
+            filt_type = int(diag.get("filtered_type_count") or 0)
+            filt_markets = diag.get("filter_markets") or []
+            filt_types = diag.get("filter_asset_types") or []
+            if raw_count == 0:
+                yield sse_event("log", {
+                    "message": "⚠️ AI 未返回任何新标的（可能因数据缺失或被市场/类型限制拒绝）",
+                    "tag": "标的过滤",
+                })
+            else:
+                yield sse_event("log", {
+                    "message": (
+                        f"⚠️ AI 返回 {raw_count} 条候选，"
+                        f"因市场/类型限制被过滤 {filt_market + filt_type} 条，"
+                        f"无 code {missing_code} 条，最终 0 条入库"
+                    ),
+                    "tag": "标的过滤",
+                })
+                if filt_markets or filt_types:
+                    yield sse_event("log", {
+                        "message": (
+                            f"  当前过滤：市场={filt_markets or '未限制'} "
+                            f"类型={filt_types or '未限制'}"
+                        ),
+                        "tag": "标的过滤",
+                    })
+                yield sse_event("log", {
+                    "message": (
+                        "  提示：到「设置 → AI 推荐」放宽 市场/类型 范围可让更多推荐入库"
+                    ),
+                    "tag": "标的过滤",
+                })
+
+        yield sse_event("log", {
+            "message": (
+                f"✅ 标的分析完成，新增 {new_count} 个推荐，更新 {existing_count} 个已有标的"
+                if new_count else
+                f"⚠️ 标的分析完成，但 0 个新推荐入库（参见上方过滤原因）"
+            ),
+            "tag": "AI",
+        })
         yield sse_event("progress", {"progress": 100})
         yield sse_event("complete", {
             "summary": payload.get("summary") or "标的分析完成",
             "report": report,
             "new_recommendations": target_analysis.get("new_recommendations") or [],
             "existing_targets_analysis": target_analysis.get("existing_targets_analysis") or [],
+            "filter_diagnostics": diag,
         })
 
     except Exception as e:
@@ -368,7 +415,42 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
             }
 
         from main import _normalize_investment_advice
-        result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status, market_snapshot)
+        diagnostics: list[dict] = []
+        result = _normalize_investment_advice(
+            raw, budgets, assets, target_items, budget_status, market_snapshot,
+            diagnostics=diagnostics,
+        )
+
+        final_advice = result.get('advice', []) or []
+        if not final_advice and diagnostics:
+            from collections import Counter
+            category_counts = Counter(d["category"] for d in diagnostics)
+            reason_counts = Counter(d["reason"] for d in diagnostics)
+            raw_count = len(raw.get("advice") or raw.get("recommendations") or [])
+            yield sse_event("log", {
+                "message": (
+                    f"⚠️ AI 返回 {raw_count} 条原始建议，全部被过滤。"
+                    f"共丢弃 {len(diagnostics)} 条。"
+                ),
+                "tag": "建议过滤",
+            })
+            for cat, cnt in category_counts.most_common():
+                yield sse_event("log", {
+                    "message": f"  • {cat}: {cnt} 条",
+                    "tag": "建议过滤",
+                })
+            for reason, cnt in reason_counts.most_common(5):
+                yield sse_event("log", {
+                    "message": f"  · {reason}（{cnt}）",
+                    "tag": "建议过滤",
+                })
+            top_category, top_count = category_counts.most_common(1)[0]
+            top_reason, _ = reason_counts.most_common(1)[0]
+            result['summary'] = (
+                (result.get('summary') or '暂无符合额度和行情约束的投资建议')
+                + f"｜过滤统计: 共 {raw_count} 条，被丢弃 {len(diagnostics)} 条；"
+                + f"主要原因 {top_category}（{top_count}）: {top_reason}"
+            )
 
         # Save to DB
         from models import InvestmentAdviceRecord
@@ -380,7 +462,14 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         db.add(record)
         db.commit()
 
-        yield sse_event("log", {"message": f"✅ 共生成 {len(result.get('advice', []))} 条交易建议", "tag": "AI"})
+        yield sse_event("log", {
+            "message": (
+                f"✅ 共生成 {len(result.get('advice', []))} 条交易建议"
+                if result.get('advice') else
+                "⚠️ 投资建议已生成 0 条，请查看上方过滤原因或检查 AI 输出"
+            ),
+            "tag": "AI",
+        })
         yield sse_event("progress", {"progress": 100})
         yield sse_event("complete", result)
 

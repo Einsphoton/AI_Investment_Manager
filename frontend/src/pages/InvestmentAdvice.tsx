@@ -83,6 +83,7 @@ export default function InvestmentAdvice() {
     setStatuses({})
     try {
       aiCtx.addLog('正在实时生成投资建议...', 'info')
+      let ranEmpty = false
       try {
         const data = await aiCtx.streamSSE('/api/investment-advice/run-stream')
         if (data) {
@@ -90,6 +91,7 @@ export default function InvestmentAdvice() {
           if ((data as any).budget_status) {
             setBudgetStatus((data as any).budget_status)
           }
+          if (((data as any).advice || []).length === 0) ranEmpty = true
         }
       } catch (e: any) {
         const data = await investmentAdviceApi.run()
@@ -97,9 +99,19 @@ export default function InvestmentAdvice() {
         if (data.budget_status) {
           setBudgetStatus(data.budget_status)
         }
+        if ((data.advice || []).length === 0) ranEmpty = true
       }
-      aiCtx.addLog('✅ AI 投资建议已生成', 'success')
-      aiCtx.completeTask()
+      if (ranEmpty) {
+        aiCtx.addLog('⚠️ AI 未生成可执行建议，详见覆盖层日志', 'warning')
+        message.warning({
+          content: 'AI 投资建议完成但 0 条入库，请打开覆盖层日志查看过滤原因。',
+          duration: 6,
+        })
+        aiCtx.completeTask()
+      } else {
+        aiCtx.addLog('✅ AI 投资建议已生成', 'success')
+        aiCtx.completeTask()
+      }
     } catch (e: any) {
       aiCtx.failTask(e?.response?.data?.detail || 'AI 投资建议生成失败')
     }

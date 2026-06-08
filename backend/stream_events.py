@@ -169,6 +169,8 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
         collected = ""
         token_count = 0
         for chunk in response:
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta
             if delta and delta.content:
                 collected += delta.content
@@ -390,6 +392,8 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         collected = ""
         token_count = 0
         for chunk in response:
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta
             if delta and delta.content:
                 collected += delta.content

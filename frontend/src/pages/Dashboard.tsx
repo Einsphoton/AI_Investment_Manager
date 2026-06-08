@@ -466,8 +466,16 @@ export default function Dashboard() {
 
         if (adviceConfigured) {
           try {
-            await investmentAdviceApi.run()
-            aiCtx.addLog('✅ AI 投资建议已生成', 'success')
+            const fb = await investmentAdviceApi.run()
+            if (fb && (fb.advice || []).length === 0) {
+              aiCtx.addLog('⚠️ AI 未生成可执行建议，详见上方过滤原因', 'warning', '投资建议')
+              message.warning({
+                content: 'AI 投资建议完成但 0 条入库，请打开覆盖层日志或「设置」检查额度/行情。',
+                duration: 6,
+              })
+            } else {
+              aiCtx.addLog('✅ AI 投资建议已生成', 'success', '投资建议')
+            }
           } catch (e: any) {
             const msg = e?.response?.data?.detail || e?.message || ''
             if (msg.includes('请先配置') || msg.includes('平台投资额度')) {

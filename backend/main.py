@@ -14,6 +14,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import and_, case
 from sqlalchemy.orm import Session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -65,6 +66,7 @@ from parallel_executor import get_parallel_config, save_parallel_config, Paralle
 from stream_events import sse_event, stream_portfolio_analysis, stream_target_analysis, stream_investment_advice
 
 scheduler = BackgroundScheduler()
+market_warmup_lock = threading.Lock()
 
 
 def _get_scheduler_config(db: Session) -> dict:
@@ -85,6 +87,95 @@ def _get_scheduler_config(db: Session) -> dict:
     }
 
 
+def _get_market_warmup_config(db: Session) -> dict:
+    interval_minutes_raw = get_setting(db, "market_warmup_interval_minutes") or "15"
+    try:
+        interval_minutes = int(interval_minutes_raw)
+    except ValueError:
+        interval_minutes = 15
+    return {
+        "enabled": get_setting(db, "market_warmup_enabled") != "false",
+        "interval_minutes": max(5, interval_minutes),
+    }
+
+
+def _asset_estimated_value_expr():
+    effective_price = case(
+        (and_(Asset.current_price.is_not(None), Asset.current_price > 0), Asset.current_price),
+        else_=Asset.buy_price,
+    )
+    return Asset.shares * effective_price
+
+
+def _holding_assets_by_estimated_value(db: Session, limit: Optional[int] = None) -> list[Asset]:
+    query = (
+        db.query(Asset)
+        .filter(Asset.shares > 0)
+        .order_by(_asset_estimated_value_expr().desc(), Asset.created_at.desc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    return query.all()
+
+
+def _refresh_asset_quote(asset: Asset, providers: dict, force_refresh: bool = False) -> bool:
+    quote = get_quote(
+        asset.code.strip().upper(),
+        asset.market,
+        asset.asset_type,
+        providers,
+        force_refresh=force_refresh,
+    )
+    if not quote or quote.get("current_price") is None:
+        return False
+    asset.current_price = quote["current_price"]
+    asset.price_updated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return True
+
+
+def refresh_market_data(
+    db: Session,
+    limit: Optional[int] = None,
+    force_refresh: bool = False,
+    blocking: bool = False,
+) -> dict:
+    if not market_warmup_lock.acquire(blocking=blocking):
+        return {"skipped": True, "reason": "market warmup already running"}
+
+    stats = {"processed": 0, "updated": 0, "failed": 0, "skipped": False}
+    try:
+        assets = _holding_assets_by_estimated_value(db, limit)
+        providers = _read_providers(db)
+        for idx, asset in enumerate(assets, start=1):
+            try:
+                if _refresh_asset_quote(asset, providers, force_refresh=force_refresh):
+                    stats["updated"] += 1
+                    db.flush()
+                stats["processed"] += 1
+                if idx % 10 == 0:
+                    db.commit()
+                time.sleep(0.35)
+            except Exception as e:
+                stats["failed"] += 1
+                print(f"[Market Warmup] {asset.code}: {e}")
+        db.commit()
+        return stats
+    finally:
+        market_warmup_lock.release()
+
+
+def scheduled_market_warmup():
+    db = SessionLocal()
+    try:
+        cfg = _get_market_warmup_config(db)
+        if not cfg["enabled"]:
+            return
+        stats = refresh_market_data(db, force_refresh=True)
+        print(f"[Market Warmup] completed: {stats}")
+    finally:
+        db.close()
+
+
 def scheduled_analysis():
     db = SessionLocal()
     try:
@@ -95,6 +186,7 @@ def scheduled_analysis():
             return
         if cfg["markets"] and not is_trading_day(cfg["markets"]):
             return
+        refresh_market_data(db, force_refresh=True, blocking=True)
         run_ai_analysis(db)
         if cfg["include_targets"]:
             _run_scheduled_target_analysis(db)
@@ -297,9 +389,44 @@ def setup_scheduler():
         cfg = _get_scheduler_config(db)
         trigger = _build_trigger(cfg)
         scheduler.add_job(scheduled_analysis, trigger, id="auto_analysis", replace_existing=True)
+
+        warmup_cfg = _get_market_warmup_config(db)
+        if warmup_cfg["enabled"]:
+            scheduler.add_job(
+                scheduled_market_warmup,
+                IntervalTrigger(minutes=warmup_cfg["interval_minutes"]),
+                id="market_warmup",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now() + timedelta(seconds=5),
+            )
     finally:
         db.close()
     scheduler.start()
+
+
+def reschedule_market_warmup(db: Session):
+    cfg = _get_market_warmup_config(db)
+    job = scheduler.get_job("market_warmup")
+    if not cfg["enabled"]:
+        if job:
+            job.remove()
+        return
+
+    trigger = IntervalTrigger(minutes=cfg["interval_minutes"])
+    if job:
+        job.reschedule(trigger=trigger)
+    else:
+        scheduler.add_job(
+            scheduled_market_warmup,
+            trigger,
+            id="market_warmup",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now() + timedelta(seconds=5),
+        )
 
 
 def reschedule_analysis(db: Session):
@@ -467,6 +594,37 @@ def get_dashboard(db: Session = Depends(get_db)):
         assets_count=len(assets),
         analysis_summary=strip_model_thinking(latest_analysis.summary) if latest_analysis else "暂无分析报告",
     )
+
+
+def _dashboard_holding_overview_assets(db: Session, limit: int = 5) -> list[Asset]:
+    return _holding_assets_by_estimated_value(db, limit)
+
+
+@app.get("/api/dashboard/holdings-overview", response_model=list[AssetResponse])
+def get_dashboard_holdings_overview(
+    limit: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    return _dashboard_holding_overview_assets(db, limit)
+
+
+@app.post("/api/dashboard/holdings-overview/refresh-prices", response_model=list[AssetResponse])
+def refresh_dashboard_holdings_overview_prices(
+    limit: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    assets = _dashboard_holding_overview_assets(db, limit)
+    providers = _read_providers(db)
+    for asset in assets:
+        try:
+            if _refresh_asset_quote(asset, providers, force_refresh=True):
+                db.flush()
+            time.sleep(0.35)
+        except Exception as e:
+            print(f"[Dashboard Refresh] {asset.code}: {e}")
+            continue
+    db.commit()
+    return _dashboard_holding_overview_assets(db, limit)
 
 
 @app.get("/api/assets", response_model=list[AssetResponse])
@@ -1819,6 +1977,9 @@ def update_settings(key: str, data: SettingsUpdate, db: Session = Depends(get_db
     }
     if key in scheduler_keys:
         reschedule_analysis(db)
+    market_warmup_keys = {"market_warmup_enabled", "market_warmup_interval_minutes"}
+    if key in market_warmup_keys:
+        reschedule_market_warmup(db)
     return SettingsResponse(key=key, value=data.value)
 
 

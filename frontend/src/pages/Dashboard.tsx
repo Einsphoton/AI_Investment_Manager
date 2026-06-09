@@ -1,12 +1,12 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
-  Card, Row, Col, Statistic, Button, Spin, Typography, Space, Table, Tag, Switch, message
+  Card, Row, Col, Statistic, Button, Spin, Typography, Space, Table, Tag, Switch, message, Tooltip
 } from 'antd'
 import {
   ArrowUpOutlined, ArrowDownOutlined, ThunderboltOutlined,
-  DollarOutlined, WalletOutlined, RiseOutlined, BarChartOutlined
+  DollarOutlined, WalletOutlined, RiseOutlined, BarChartOutlined, ReloadOutlined
 } from '@ant-design/icons'
 import { dashboardApi, analysisApi, assetsApi, targetsApi, investmentAdviceApi, parallelApi, DashboardData, AnalysisRecord, Asset } from '../api'
 import { useNavigate } from 'react-router-dom'
@@ -205,13 +205,14 @@ export default function Dashboard() {
   const [parallelConfigEnabled, setParallelConfigEnabled] = useState(false)
   const [configLoaded, setConfigLoaded] = useState(false)
   const [assets, setAssets] = useState<Asset[]>([])
+  const [priceRefreshing, setPriceRefreshing] = useState(false)
   const navigate = useNavigate()
 
   const fetchData = async () => {
     try {
       const [dash, assetsData, latestAnalysis, parallelCfg] = await Promise.all([
         dashboardApi.get(),
-        assetsApi.list(),
+        dashboardApi.holdingsOverview(),
         analysisApi.latest().catch(() => null),
         parallelApi.getConfig().catch(() => null),
       ])
@@ -229,6 +230,27 @@ export default function Dashboard() {
     }
   }
 
+  const refreshDashboardPrices = async (options?: { silent?: boolean }) => {
+    if (priceRefreshing) return
+    setPriceRefreshing(true)
+    try {
+      const assetsData = await dashboardApi.refreshHoldingsOverviewPrices()
+      const dash = await dashboardApi.get()
+      setDashboard(dash)
+      setAssets(assetsData)
+      if (!options?.silent) {
+        message.success('行情已刷新')
+      }
+    } catch (e: any) {
+      console.warn('Failed to refresh dashboard prices', e)
+      if (!options?.silent) {
+        message.error(e?.response?.data?.detail || e?.message || '刷新行情失败')
+      }
+    } finally {
+      setPriceRefreshing(false)
+    }
+  }
+
   useEffect(() => {
     fetchData()
   }, [])
@@ -238,14 +260,15 @@ export default function Dashboard() {
   }
 
   const runAssetDetailAnalysis = async () => {
-    if (assets.length === 0) {
-      console.warn('[Dashboard] assets is empty, skipping asset detail analysis')
+    const analysisAssets = (await assetsApi.list()).filter(asset => (asset.shares || 0) > 0)
+    if (analysisAssets.length === 0) {
+      console.warn('[Dashboard] analysis assets is empty, skipping asset detail analysis')
       return
     }
     // 逐个资产分析，避免单次 AI 请求因超时或代理断开而整体失败
     let succeeded = 0
     let failed = 0
-    for (const asset of assets) {
+    for (const asset of analysisAssets) {
       try {
         await analysisApi.agentRun({
           asset_ids: [asset.id],
@@ -513,6 +536,20 @@ export default function Dashboard() {
     }
   }
 
+  const hasValidCurrentPrice = (asset: Asset) => asset.current_price != null && asset.current_price > 0
+  const effectivePrice = (asset: Asset) => hasValidCurrentPrice(asset) ? asset.current_price! : asset.buy_price
+  const estimatedMarketValue = (asset: Asset) => asset.shares * effectivePrice(asset)
+  const overviewAssets = useMemo(() => {
+    return [...assets]
+      .filter(asset => (asset.shares || 0) > 0)
+      .sort((a, b) => {
+        const byValue = estimatedMarketValue(b) - estimatedMarketValue(a)
+        if (byValue !== 0) return byValue
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      })
+      .slice(0, 5)
+  }, [assets])
+
   if (loading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '60vh' }}>
@@ -588,20 +625,31 @@ export default function Dashboard() {
     {
       title: '市值', key: 'mv',
       render: (_: any, r: Asset) => {
-        const effectivePrice = r.current_price != null && r.current_price > 0 ? r.current_price : r.buy_price
-        const mv = r.shares * effectivePrice
-        return <span style={{ fontWeight: 500 }}>¥{mv.toFixed(2)}</span>
+        const estimated = !hasValidCurrentPrice(r)
+        const mv = estimatedMarketValue(r)
+        return (
+          <Space size={4}>
+            <span style={{ fontWeight: 500, color: estimated ? '#9a9892' : undefined }}>¥{mv.toFixed(2)}</span>
+            {estimated && (
+              <Tag style={{ marginInlineEnd: 0, borderRadius: 6, color: '#8a867d', borderColor: 'rgba(255,255,255,0.08)', background: 'transparent' }}>
+                估
+              </Tag>
+            )}
+          </Space>
+        )
       },
     },
     {
       title: '盈亏', key: 'pnl',
       render: (_: any, r: Asset) => {
-        const effectivePrice = r.current_price != null && r.current_price > 0 ? r.current_price : r.buy_price
-        const pnl = r.shares * (effectivePrice - r.buy_price)
-        const color = pnl >= 0 ? greenStyle.color : redStyle.color
+        if (!hasValidCurrentPrice(r)) {
+          return <span style={{ color: '#5c5a55', fontWeight: 500 }}>暂无行情</span>
+        }
+        const pnl = r.shares * (effectivePrice(r) - r.buy_price)
+        const color = pnl > 0 ? greenStyle.color : pnl < 0 ? redStyle.color : '#9a9892'
         return (
           <span style={{ color, fontWeight: 600 }}>
-            {pnl >= 0 ? '+' : ''}¥{pnl.toFixed(2)}
+            {pnl > 0 ? '+' : ''}¥{pnl.toFixed(2)}
           </span>
         )
       },
@@ -804,18 +852,30 @@ export default function Dashboard() {
               </Space>
             }
             extra={
-              <Button
-                type="link"
-                onClick={() => navigate('/assets')}
-                style={{ color: '#c9a84c', fontSize: 13 }}
-              >
-                查看全部 →
-              </Button>
+              <Space size={4}>
+                <Tooltip title="刷新行情">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<ReloadOutlined spin={priceRefreshing} />}
+                    loading={priceRefreshing}
+                    onClick={() => refreshDashboardPrices()}
+                    style={{ color: '#c9a84c' }}
+                  />
+                </Tooltip>
+                <Button
+                  type="link"
+                  onClick={() => navigate('/assets')}
+                  style={{ color: '#c9a84c', fontSize: 13 }}
+                >
+                  查看全部 →
+                </Button>
+              </Space>
             }
           >
-            {assets.length > 0 ? (
+            {overviewAssets.length > 0 ? (
               <Table
-                dataSource={assets.slice(0, 5)}
+                dataSource={overviewAssets}
                 columns={assetColumns}
                 rowKey="id"
                 pagination={false}

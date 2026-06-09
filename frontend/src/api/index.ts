@@ -246,6 +246,10 @@ export interface AIChatContextResponse {
 
 export const dashboardApi = {
   get: () => api.get<DashboardData>('/dashboard').then(r => r.data),
+  holdingsOverview: (limit = 5) =>
+    api.get<Asset[]>('/dashboard/holdings-overview', { params: { limit } }).then(r => r.data),
+  refreshHoldingsOverviewPrices: (limit = 5) =>
+    api.post<Asset[]>('/dashboard/holdings-overview/refresh-prices', null, { params: { limit } }).then(r => r.data),
 }
 
 export const assetsApi = {

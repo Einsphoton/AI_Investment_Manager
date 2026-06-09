@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAIWorkContext } from '../stores/AIWorkContext'
-import { Button, Card, Col, Empty, message, Modal, Row, Space, Spin, Tag, Tooltip, Typography, Progress, Descriptions } from 'antd'
+import { Button, Card, Col, Empty, message, Modal, Row, Space, Spin, Tag, Tooltip, Typography, Progress, Descriptions, Radio } from 'antd'
 import {
   CheckOutlined, CloseOutlined, DollarOutlined, RobotOutlined,
   ThunderboltOutlined, WalletOutlined, ReloadOutlined, BarChartOutlined, FundOutlined,
 } from '@ant-design/icons'
-import { investmentAdviceApi, InvestmentAdviceItem, InvestmentAdviceResponse, marketApi, MarketHistoryItem, transformMarketHistory } from '../api'
+import { investmentAdviceApi, InvestmentAdviceItem, InvestmentAdviceResponse, marketApi, MarketHistoryItem, transformMarketHistory, type AssetScope, type AssetSource } from '../api'
 import { type NetValuePeriod, NetValueRangeSelector, PriceLineChart } from '../components/MarketCharts'
 
 const { Text } = Typography
@@ -27,6 +27,28 @@ const percentOf = (used: number, total: number) => {
   return Math.min(100, Math.round((used / total) * 100))
 }
 
+const assetScopeOptions = [
+  { label: '全部资产', value: 'all' },
+  { label: '手动资产', value: 'manual' },
+  { label: 'AI 建仓', value: 'ai_advice' },
+]
+
+const assetScopeLabel = (scope?: string) => {
+  if (scope === 'manual') return '手动资产'
+  if (scope === 'ai_advice') return 'AI 建仓资产'
+  return '全部资产'
+}
+
+const adviceAssetSource = (item?: Partial<InvestmentAdviceItem> | null, fallbackScope?: string): AssetSource => {
+  if (item?.asset_source === 'manual' || item?.asset_source === 'ai_advice') return item.asset_source
+  if (fallbackScope === 'manual' || fallbackScope === 'ai_advice') return fallbackScope
+  return item?.source === 'holding' ? 'manual' : 'ai_advice'
+}
+
+const adviceAssetSourceLabel = (item?: Partial<InvestmentAdviceItem> | null, fallbackScope?: string) => (
+  item?.asset_source_label || assetScopeLabel(adviceAssetSource(item, fallbackScope))
+)
+
 export default function InvestmentAdvice() {
   const aiCtx = useAIWorkContext()
   const [initialLoading, setInitialLoading] = useState(true)
@@ -34,6 +56,10 @@ export default function InvestmentAdvice() {
   const [result, setResult] = useState<InvestmentAdviceResponse | null>(null)
   const [statuses, setStatuses] = useState<Record<string, 'accepted' | 'dismissed'>>({})
   const [budgetStatus, setBudgetStatus] = useState<any[]>([])
+  const [assetScope, setAssetScope] = useState<AssetScope>(() => {
+    const saved = localStorage.getItem('investment_advice_asset_scope') as AssetScope | null
+    return saved === 'manual' || saved === 'ai_advice' || saved === 'all' ? saved : 'all'
+  })
   const timerRef = useRef<ReturnType<typeof setInterval>>()
 
   // Load budget status independently & periodically
@@ -78,14 +104,19 @@ export default function InvestmentAdvice() {
     investmentAdviceApi.latest().then(d => setResult(d)).catch(() => {})
   }
 
+  const changeAssetScope = (nextScope: AssetScope) => {
+    setAssetScope(nextScope)
+    localStorage.setItem('investment_advice_asset_scope', nextScope)
+  }
+
   const runAdvice = async () => {
-    aiCtx.startTask('AI 投资建议')
+    aiCtx.startTask(`AI 投资建议（${assetScopeLabel(assetScope)}）`)
     setStatuses({})
     try {
-      aiCtx.addLog('正在实时生成投资建议...', 'info')
+      aiCtx.addLog(`正在实时生成${assetScopeLabel(assetScope)}投资建议...`, 'info')
       let ranEmpty = false
       try {
-        const data = await aiCtx.streamSSE('/api/investment-advice/run-stream')
+        const data = await aiCtx.streamSSE('/api/investment-advice/run-stream', { asset_scope: assetScope })
         if (data) {
           setResult(data as any)
           if ((data as any).budget_status) {
@@ -94,7 +125,7 @@ export default function InvestmentAdvice() {
           if (((data as any).advice || []).length === 0) ranEmpty = true
         }
       } catch (e: any) {
-        const data = await investmentAdviceApi.run()
+        const data = await investmentAdviceApi.run(assetScope)
         setResult(data)
         if (data.budget_status) {
           setBudgetStatus(data.budget_status)
@@ -122,7 +153,7 @@ export default function InvestmentAdvice() {
     try {
       await investmentAdviceApi.accept(item)
       setStatuses(prev => ({ ...prev, [item.id]: 'accepted' }))
-      message.success('已采纳并写入我的资产')
+      message.success(`已采纳并写入${adviceAssetSourceLabel(item, result?.asset_scope)}`)
       // Refresh budget status
       loadBudgetStatus()
       investmentAdviceApi.latest().then(d => setResult(d)).catch(() => {})
@@ -288,15 +319,26 @@ export default function InvestmentAdvice() {
           </Space>
         }
         extra={
-          <Button
-            type="primary"
-            icon={<ThunderboltOutlined />}
-            loading={aiCtx.state.isRunning}
-            onClick={runAdvice}
-            style={{ borderRadius: 10, fontWeight: 600 }}
-          >
-            AI 投资建议
-          </Button>
+          <Space size={8} style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <Radio.Group
+              size="small"
+              optionType="button"
+              buttonStyle="solid"
+              options={assetScopeOptions}
+              value={assetScope}
+              disabled={aiCtx.state.isRunning}
+              onChange={e => changeAssetScope(e.target.value)}
+            />
+            <Button
+              type="primary"
+              icon={<ThunderboltOutlined />}
+              loading={aiCtx.state.isRunning}
+              onClick={runAdvice}
+              style={{ borderRadius: 10, fontWeight: 600 }}
+            >
+              AI 投资建议
+            </Button>
+          </Space>
         }
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
@@ -391,6 +433,7 @@ export default function InvestmentAdvice() {
             {result.advice.map((item: any) => {
               const status = statuses[item.id]
               const isBuy = item.trade_type === 'BUY'
+              const itemAssetSource = adviceAssetSource(item, result?.asset_scope)
               return (
                 <Card key={item.id} size="small" style={{
                   borderRadius: 8,
@@ -413,6 +456,14 @@ export default function InvestmentAdvice() {
                           {item.code}·{item.asset_type_label}
                         </Text>
                         <Text style={{ color: '#5c5a55', fontSize: 11, whiteSpace: 'nowrap' }}>{item.market_label}</Text>
+                        <Tag style={{
+                          margin: 0, borderRadius: 4, fontSize: 10, lineHeight: '18px', padding: '0 6px',
+                          background: itemAssetSource === 'manual' ? 'rgba(120,185,255,0.12)' : 'rgba(201,168,76,0.12)',
+                          border: itemAssetSource === 'manual' ? '1px solid rgba(120,185,255,0.24)' : '1px solid rgba(201,168,76,0.24)',
+                          color: itemAssetSource === 'manual' ? '#78b9ff' : '#c9a84c',
+                        }}>
+                          {adviceAssetSourceLabel(item, result?.asset_scope)}
+                        </Tag>
                       </Space>
                     </Col>
 
@@ -521,6 +572,7 @@ export default function InvestmentAdvice() {
               }}
             >
               <Descriptions.Item label="平台">{analysisModal.item?.platform}</Descriptions.Item>
+              <Descriptions.Item label="资产空间">{adviceAssetSourceLabel(analysisModal.item, result?.asset_scope)}</Descriptions.Item>
               <Descriptions.Item label="资产类型">{analysisModal.item?.asset_type_label}</Descriptions.Item>
               <Descriptions.Item label="市场">{analysisModal.item?.market_label}</Descriptions.Item>
               <Descriptions.Item label="买卖">{analysisModal.item?.trade_type_label}</Descriptions.Item>

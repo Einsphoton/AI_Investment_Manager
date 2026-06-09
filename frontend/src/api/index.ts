@@ -83,6 +83,9 @@ export interface Asset {
   updated_at: string
 }
 
+export type AssetSource = 'manual' | 'ai_advice'
+export type AssetScope = 'all' | AssetSource
+
 export interface DashboardData {
   total_market_value: number
   total_cost: number
@@ -192,6 +195,8 @@ export interface InvestmentAdviceItem {
   confidence_score: number
   risk_note: string
   source: string
+  asset_source: AssetSource
+  asset_source_label: string
   asset_id: number | null
 }
 
@@ -210,6 +215,8 @@ export interface InvestmentAdviceResponse {
     key_facts?: string[]
     why?: string
   }>
+  asset_scope?: AssetScope
+  asset_scope_label?: string
 }
 
 export interface AIChatMessage {
@@ -253,7 +260,7 @@ export const dashboardApi = {
 }
 
 export const assetsApi = {
-  list: (params?: { asset_type?: string; market?: string }) =>
+  list: (params?: { asset_type?: string; market?: string; source?: AssetScope }) =>
     api.get<Asset[]>('/assets', { params }).then(r => r.data),
   create: (data: Partial<Asset>) =>
     api.post<Asset>('/assets', data).then(r => r.data),
@@ -281,7 +288,8 @@ export const analysisApi = {
 
 export const investmentAdviceApi = {
   latest: () => api.get<InvestmentAdviceResponse>("/investment-advice/latest").then(r => r.data),
-  run: () => api.post<InvestmentAdviceResponse>('/investment-advice/run').then(r => r.data),
+  run: (assetScope: AssetScope = 'all') =>
+    api.post<InvestmentAdviceResponse>('/investment-advice/run', null, { params: { asset_scope: assetScope } }).then(r => r.data),
   accept: (advice: InvestmentAdviceItem) =>
     api.post('/investment-advice/accept', { advice }).then(r => r.data),
   check: () => api.get<{configured: boolean; budget_count: number}>('/investment-advice/check').then(r => r.data),

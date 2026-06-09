@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
 
@@ -15,6 +15,7 @@ class AssetCreate(BaseModel):
     buy_date: str
     current_price: Optional[float] = None
     note: str = ""
+    source: str = "manual"
 
 
 class AssetUpdate(BaseModel):
@@ -28,6 +29,7 @@ class AssetUpdate(BaseModel):
     buy_date: Optional[str] = None
     current_price: Optional[float] = None
     note: Optional[str] = None
+    source: Optional[str] = None
 
 
 class AssetResponse(BaseModel):
@@ -46,6 +48,11 @@ class AssetResponse(BaseModel):
     source: str = "manual"
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def normalize_source(cls, value):
+        return "ai_advice" if value == "ai_advice" else "manual"
 
     class Config:
         from_attributes = True
@@ -208,6 +215,8 @@ class InvestmentAdviceResponse(BaseModel):
     market_context: dict = {}
     market_snapshot: dict = {}
     decision_audit: list[dict] = []
+    asset_scope: str = "all"
+    asset_scope_label: str = "全部资产"
 
 
 class AIChatMessage(BaseModel):

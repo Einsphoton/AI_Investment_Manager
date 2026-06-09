@@ -511,15 +511,16 @@ def _cleanup_stream_jobs() -> None:
             _stream_jobs.pop(job_id, None)
 
 
-def _run_stream_job(job_id: str, url: str) -> None:
+def _run_stream_job(job_id: str, url: str, body: dict | None = None) -> None:
     db = SessionLocal()
+    body = body or {}
     try:
         if url == "/api/analysis/run-stream":
             generator = stream_portfolio_analysis(db)
         elif url == "/api/targets/ai-analyze-stream":
             generator = stream_target_analysis(db)
         elif url == "/api/investment-advice/run-stream":
-            generator = stream_investment_advice(db)
+            generator = stream_investment_advice(db, asset_scope=str(body.get("asset_scope") or "all"))
         else:
             _append_stream_job_event(job_id, "error", {"detail": f"不支持的流式任务: {url}"})
             return
@@ -631,6 +632,7 @@ def refresh_dashboard_holdings_overview_prices(
 def list_assets(
     asset_type: Optional[str] = Query(None),
     market: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     query = db.query(Asset)
@@ -638,6 +640,11 @@ def list_assets(
         query = query.filter(Asset.asset_type == asset_type)
     if market:
         query = query.filter(Asset.market == market)
+    source_scope = _normalize_asset_scope(source, "all") if source else "all"
+    if source_scope == "ai_advice":
+        query = query.filter(Asset.source == "ai_advice")
+    elif source_scope == "manual":
+        query = query.filter((Asset.source.is_(None)) | (Asset.source != "ai_advice"))
     return query.order_by(Asset.created_at.desc()).all()
 
 
@@ -669,6 +676,7 @@ def _asset_analysis_data(asset: Asset) -> dict:
         "market": asset.market,
         "asset_type": asset.asset_type,
         "platform": asset.platform,
+        "source": _asset_source(asset),
         "shares": asset.shares,
         "buy_price": asset.buy_price,
         "current_price": current_price,
@@ -1033,6 +1041,41 @@ def _currency_label(currency: str) -> str:
     return {"CNY": "人民币", "HKD": "港元", "USD": "美元"}.get(currency, currency)
 
 
+def _asset_source(asset: Asset | None) -> str:
+    source = str(getattr(asset, "source", "") or "manual").strip()
+    return "ai_advice" if source == "ai_advice" else "manual"
+
+
+def _normalize_asset_scope(value: str | None, default: str = "all") -> str:
+    raw = str(value or default or "all").strip().lower()
+    mapping = {
+        "all": "all",
+        "manual": "manual",
+        "ai": "ai_advice",
+        "ai_advice": "ai_advice",
+        "ai_build": "ai_advice",
+        "ai_portfolio": "ai_advice",
+    }
+    return mapping.get(raw, default if default in {"all", "manual", "ai_advice"} else "all")
+
+
+def _asset_scope_label(scope: str) -> str:
+    return {
+        "manual": "手动资产",
+        "ai_advice": "AI 建仓资产",
+        "all": "全部资产",
+    }.get(scope, "全部资产")
+
+
+def _filter_assets_by_scope(assets: list[Asset], scope: str) -> list[Asset]:
+    scope = _normalize_asset_scope(scope)
+    if scope == "manual":
+        return [asset for asset in assets if _asset_source(asset) == "manual"]
+    if scope == "ai_advice":
+        return [asset for asset in assets if _asset_source(asset) == "ai_advice"]
+    return assets
+
+
 def _load_investment_budgets(db: Session) -> list[dict]:
     raw_items = _safe_json_loads(get_setting(db, "investment_budget_configs"), [])
     if not isinstance(raw_items, list):
@@ -1249,13 +1292,24 @@ def _build_investment_advice_prompt(
     asset_items: list[dict],
     target_items: list[dict],
     today_analysis: dict,
+    asset_scope: str = "all",
 ) -> tuple[str, dict]:
+    asset_scope = _normalize_asset_scope(asset_scope, "all")
     market_snapshot = _investment_market_snapshot(asset_items, target_items, budget_status)
+    market_snapshot["asset_scope"] = {
+        "value": asset_scope,
+        "label": _asset_scope_label(asset_scope),
+    }
     candidate_digest = _compact_investment_candidates(asset_items, target_items, today_analysis)
 
     prompt = f"""{system_prompt}
 
 请生成“AI 投资建议”交易清单。你必须先根据本次运行时的行情、持仓盈亏、额度状态和标的池证据做完整决策，再输出少量可执行建议；禁止为了凑数量而从持仓或标的池里随便挑选。
+
+## 本次资产空间
+{_asset_scope_label(asset_scope)}
+
+说明：手动资产和 AI 建仓资产需要隔离管理。你只能基于本次资产空间中的持仓做持仓分析、卖出或加仓建议；买入新标的时也要服务于本次资产空间。
 
 ## 本次运行市场环境快照
 {json.dumps(market_snapshot, ensure_ascii=False, default=str)}
@@ -1481,6 +1535,7 @@ def _normalize_investment_advice(
     budget_status: list[dict],
     market_snapshot: dict | None = None,
     diagnostics: list[dict] | None = None,
+    asset_scope: str = "all",
 ) -> dict:
     if not isinstance(raw, dict):
         raw = {}
@@ -1488,6 +1543,7 @@ def _normalize_investment_advice(
     raw_items = raw.get("advice") or raw.get("recommendations") or []
     if not isinstance(raw_items, list):
         raw_items = []
+    asset_scope = _normalize_asset_scope(asset_scope, "all")
     market_snapshot = market_snapshot or raw.get("market_snapshot") or {}
 
     assets_by_key = {
@@ -1535,6 +1591,7 @@ def _normalize_investment_advice(
             _drop("evidence_gate", gate_reason, code, trade_type)
             continue
         name = strip_model_thinking(item.get("name") or item.get("asset_name") or (existing_asset.name if existing_asset else candidate.get("name")) or code)
+        asset_source = _asset_source(existing_asset) if existing_asset else ("manual" if asset_scope == "manual" else "ai_advice")
         platform = str(item.get("platform") or "").strip()
         budget = _find_budget(budget_status, item.get("budget_id"), platform, market, asset_type)
         if not budget:
@@ -1596,6 +1653,8 @@ def _normalize_investment_advice(
             "confidence_score": int(_normalize_ai_number(item.get("confidence_score"), 50)),
             "risk_note": strip_model_thinking(item.get("risk_note") or item.get("risk_warning") or ""),
             "source": "holding" if existing_asset else "target",
+            "asset_source": asset_source,
+            "asset_source_label": _asset_scope_label(asset_source),
             "asset_id": existing_asset.id if existing_asset else None,
         })
 
@@ -1609,6 +1668,8 @@ def _normalize_investment_advice(
         "market_context": market_context,
         "market_snapshot": market_snapshot,
         "decision_audit": decision_audit,
+        "asset_scope": asset_scope,
+        "asset_scope_label": _asset_scope_label(asset_scope),
     })
 
 
@@ -1655,7 +1716,11 @@ def get_asset_detail(asset_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/assets", response_model=AssetResponse)
 def create_asset(asset: AssetCreate, db: Session = Depends(get_db)):
-    db_asset = Asset(**asset.model_dump())
+    data = asset.model_dump()
+    data["source"] = _normalize_asset_scope(data.get("source"), "manual")
+    if data["source"] == "all":
+        data["source"] = "manual"
+    db_asset = Asset(**data)
     db.add(db_asset)
     db.commit()
     db.refresh(db_asset)
@@ -1668,6 +1733,10 @@ def update_asset(asset_id: int, asset: AssetUpdate, db: Session = Depends(get_db
     if not db_asset:
         raise HTTPException(status_code=404, detail="资产不存在")
     update_data = asset.model_dump(exclude_unset=True)
+    if "source" in update_data:
+        update_data["source"] = _normalize_asset_scope(update_data.get("source"), _asset_source(db_asset))
+        if update_data["source"] == "all":
+            update_data["source"] = _asset_source(db_asset)
     for key, value in update_data.items():
         setattr(db_asset, key, value)
     db.commit()
@@ -1892,6 +1961,9 @@ def create_stream_job(payload: dict):
     }
     if url not in supported:
         raise HTTPException(status_code=400, detail=f"不支持的流式任务: {url}")
+    body = (payload or {}).get("body") or {}
+    if not isinstance(body, dict):
+        body = {}
 
     _cleanup_stream_jobs()
     job_id = uuid.uuid4().hex
@@ -1905,9 +1977,10 @@ def create_stream_job(payload: dict):
             "events": [],
             "done": False,
             "error": None,
+            "body": body,
         }
 
-    worker = threading.Thread(target=_run_stream_job, args=(job_id, url), daemon=True)
+    worker = threading.Thread(target=_run_stream_job, args=(job_id, url, body), daemon=True)
     worker.start()
     return {"job_id": job_id}
 
@@ -2171,6 +2244,7 @@ def _build_backup_payload(db: Session, include_settings: bool = True) -> dict:
                 "current_price": a.current_price,
                 "price_updated_at": a.price_updated_at,
                 "note": a.note,
+                "source": _asset_source(a),
             }
             for a in assets
         ],
@@ -2333,11 +2407,14 @@ def advice_check(db: Session = Depends(get_db)):
 
 
 @app.post("/api/investment-advice/run-stream")
-def advice_run_stream(db: Session = Depends(get_db)):
+def advice_run_stream(
+    asset_scope: str = Query("all"),
+    db: Session = Depends(get_db),
+):
     """SSE streaming endpoint for investment advice."""
     from fastapi.responses import StreamingResponse
     return StreamingResponse(
-        stream_investment_advice(db),
+        stream_investment_advice(db, asset_scope=asset_scope),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
@@ -2741,7 +2818,11 @@ def agent_analysis_run(req: AgentAnalysisRequest, db: Session = Depends(get_db))
 
 
 @app.post("/api/investment-advice/run", response_model=InvestmentAdviceResponse)
-def run_investment_advice(db: Session = Depends(get_db)):
+def run_investment_advice(
+    asset_scope: str = Query("all"),
+    db: Session = Depends(get_db),
+):
+    asset_scope = _normalize_asset_scope(asset_scope, "all")
     api_key = get_setting(db, "openai_api_key")
     base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
     model = get_setting(db, "openai_model") or "gpt-4o-mini"
@@ -2752,9 +2833,10 @@ def run_investment_advice(db: Session = Depends(get_db)):
     if not budgets:
         raise HTTPException(status_code=400, detail="请先在设置页面配置平台投资额度")
 
-    assets = db.query(Asset).all()
+    all_assets = db.query(Asset).all()
+    assets = _filter_assets_by_scope(all_assets, asset_scope)
     providers = _read_providers(db)
-    budget_status = _investment_budget_status(budgets, assets)
+    budget_status = _investment_budget_status(budgets, all_assets)
     asset_items, target_items = _candidate_investment_targets(db, budgets, assets, providers)
     today_analysis = _latest_today_asset_analysis(db, assets)
     personality = get_setting(db, "ai_personality") or "balanced"
@@ -2775,6 +2857,7 @@ def run_investment_advice(db: Session = Depends(get_db)):
         asset_items,
         target_items,
         today_analysis,
+        asset_scope,
     )
 
     try:
@@ -2793,7 +2876,10 @@ def run_investment_advice(db: Session = Depends(get_db)):
         print(f"[InvestmentAdvice] AI failed: {e}")
         raw = _fallback_investment_advice(budget_status, target_items)
 
-    result = _normalize_investment_advice(raw, budgets, assets, target_items, budget_status, market_snapshot)
+    result = _normalize_investment_advice(
+        raw, budgets, assets, target_items, budget_status, market_snapshot,
+        asset_scope=asset_scope,
+    )
     # 持久化投资建议到数据库
     from models import InvestmentAdviceRecord
     record = InvestmentAdviceRecord(
@@ -2820,13 +2906,22 @@ def get_latest_investment_advice(db: Session = Depends(get_db)):
     record = db.query(InvestmentAdviceRecord).order_by(InvestmentAdviceRecord.created_at.desc()).first()
     if not record:
         raise HTTPException(status_code=404, detail='暂无投资建议记录')
+    advice = json.loads(record.advice_json or '[]')
+    advice_sources = {
+        _normalize_asset_scope(item.get("asset_source"), "all")
+        for item in advice
+        if isinstance(item, dict) and item.get("asset_source")
+    }
+    asset_scope = next(iter(advice_sources)) if len(advice_sources) == 1 else "all"
     return {
         'summary': record.summary or '',
-        'advice': json.loads(record.advice_json or '[]'),
+        'advice': advice,
         'budget_status': json.loads(record.budget_status_json or '[]'),
         'market_context': {},
         'market_snapshot': {},
         'decision_audit': [],
+        'asset_scope': asset_scope,
+        'asset_scope_label': _asset_scope_label(asset_scope),
     }
 
 
@@ -3148,20 +3243,30 @@ def run_ai_chat(req: AIChatRequest, db: Session = Depends(get_db)):
 
 
 def _find_asset_for_advice(db: Session, advice: dict) -> Asset | None:
+    desired_source = _normalize_asset_scope(advice.get("asset_source") or advice.get("asset_scope"), "all")
+
+    def source_matches(asset: Asset) -> bool:
+        return desired_source == "all" or _asset_source(asset) == desired_source
+
     asset_id = advice.get("asset_id")
     if asset_id:
         asset = db.query(Asset).filter(Asset.id == asset_id).first()
-        if asset:
+        if asset and source_matches(asset):
             return asset
     code = _analysis_code_key(advice.get("code") or "")
     platform = str(advice.get("platform") or "").strip()
     market = str(advice.get("market") or "").strip().upper()
     asset_type = str(advice.get("asset_type") or "").strip()
-    assets = db.query(Asset).filter(
+    query = db.query(Asset).filter(
         Asset.platform == platform,
         Asset.market == market,
         Asset.asset_type == asset_type,
-    ).all()
+    )
+    if desired_source == "ai_advice":
+        query = query.filter(Asset.source == "ai_advice")
+    elif desired_source == "manual":
+        query = query.filter((Asset.source.is_(None)) | (Asset.source != "ai_advice"))
+    assets = query.all()
     return next((asset for asset in assets if _analysis_code_key(asset.code) == code), None)
 
 
@@ -3197,7 +3302,10 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
         price = live_price
 
     trade_date = date.today().isoformat()
-    note = f"采纳 AI 投资建议：{advice.get('reason') or ''}".strip()
+    asset_source = _normalize_asset_scope(advice.get("asset_source") or advice.get("asset_scope"), "ai_advice")
+    if asset_source == "all":
+        asset_source = "ai_advice"
+    note = f"采纳 AI 投资建议（{_asset_scope_label(asset_source)}）：{advice.get('reason') or ''}".strip()
     asset = _find_asset_for_advice(db, advice)
 
     if trade_type == "BUY":
@@ -3218,8 +3326,8 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
                 buy_date=trade_date,
                 current_price=price,
                 price_updated_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                note="由 AI 投资建议采纳创建",
-                source="ai_advice",
+                note=f"由 AI 投资建议采纳创建（{_asset_scope_label(asset_source)}）",
+                source=asset_source,
             )
             db.add(asset)
             db.flush()

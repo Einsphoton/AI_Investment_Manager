@@ -17,6 +17,13 @@ const goldStyle = { color: '#c9a84c' }
 const greenStyle = { color: 'oklch(72% 0.14 145)' }
 const redStyle = { color: 'oklch(65% 0.18 25)' }
 
+const toFiniteNumber = (value: unknown, fallback = 0) => {
+  const num = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(num) ? num : fallback
+}
+
+const hasHoldingAssets = (items: Asset[]) => items.some(asset => toFiniteNumber(asset.shares) > 0)
+
 const renderInlineMarkdown = (text: string): ReactNode[] => (
   text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean).map((part, idx) => {
     if (part.startsWith('**') && part.endsWith('**')) {
@@ -260,7 +267,7 @@ export default function Dashboard() {
   }
 
   const runAssetDetailAnalysis = async () => {
-    const analysisAssets = (await assetsApi.list()).filter(asset => (asset.shares || 0) > 0)
+    const analysisAssets = (await assetsApi.list()).filter(asset => toFiniteNumber(asset.shares) > 0)
     if (analysisAssets.length === 0) {
       console.warn('[Dashboard] analysis assets is empty, skipping asset detail analysis')
       return
@@ -287,11 +294,20 @@ export default function Dashboard() {
   }
 
   const runAnalysis = async () => {
-    aiCtx.startTask('一键 AI 分析')
+    aiCtx.startTask(isEmptyPortfolio ? '一键 AI 建仓' : '一键 AI 分析')
     try {
+      const currentAssets = await assetsApi.list().catch(() => assets)
+      const emptyPortfolioMode = !hasHoldingAssets(currentAssets)
+      if (emptyPortfolioMode) {
+        aiCtx.addLog('检测到当前为空仓，已切换为 AI 建仓流程：先推荐标的，再生成投资建议。', 'info', '建仓')
+      }
+
+      const shouldRunTargets = includeTargets || emptyPortfolioMode
+      const shouldConsiderAdvice = includeAdvice || emptyPortfolioMode
+
       // Pre-check if advice is configured (non-SSE, lightweight call)
-      let adviceConfigured = includeAdvice
-      if (includeAdvice) {
+      let adviceConfigured = false
+      if (shouldConsiderAdvice) {
         try {
           const check = await investmentAdviceApi.check()
           adviceConfigured = check.configured
@@ -303,9 +319,13 @@ export default function Dashboard() {
           aiCtx.addLog('⏭️ AI 投资建议跳过（检查配置失败）', 'info')
         }
       }
+      const shouldRunAdvice = shouldConsiderAdvice && adviceConfigured
+      if (emptyPortfolioMode && !shouldRunAdvice) {
+        aiCtx.addLog('建仓买入建议需要先配置平台额度；本次会先生成推荐标的池。', 'info', '建仓')
+      }
 
       // Use parallel UI when parallel_dashboard_steps is enabled AND there are multiple steps
-      const hasMultipleSteps = configLoaded && parallelConfigEnabled && (includeTargets || adviceConfigured)
+      const hasMultipleSteps = configLoaded && parallelConfigEnabled && (shouldRunTargets || shouldRunAdvice)
       if (hasMultipleSteps) {
         // === PARALLEL MODE with streaming sub-tasks ===
         const subtaskIds: string[] = []
@@ -348,7 +368,7 @@ export default function Dashboard() {
             aiCtx.addLog('✅ AI 资产分析与详情报告完成', 'success', '资产分析')
           },
         })
-        if (includeTargets) {
+        if (shouldRunTargets) {
           tasks.push({
             id: 'targets', name: '标的分析', icon: '🎯',
             run: async () => {
@@ -393,7 +413,7 @@ export default function Dashboard() {
             },
           })
         }
-        if (adviceConfigured) {
+        if (shouldRunAdvice) {
           tasks.push({
             id: 'advice', name: '投资建议', icon: '💡',
             run: async () => {
@@ -495,7 +515,7 @@ export default function Dashboard() {
           aiCtx.addLog('✅ AI 资产分析与详情报告完成', 'success')
         }
 
-        if (includeTargets) {
+        if (shouldRunTargets) {
           try {
             await targetsApi.aiAnalyze()
             aiCtx.addLog('✅ AI 推荐标的完成', 'success')
@@ -504,7 +524,7 @@ export default function Dashboard() {
           }
         }
 
-        if (adviceConfigured) {
+        if (shouldRunAdvice) {
           try {
             const fb = await investmentAdviceApi.run()
             if (fb && (fb.advice || []).length === 0) {
@@ -536,12 +556,12 @@ export default function Dashboard() {
     }
   }
 
-  const hasValidCurrentPrice = (asset: Asset) => asset.current_price != null && asset.current_price > 0
-  const effectivePrice = (asset: Asset) => hasValidCurrentPrice(asset) ? asset.current_price! : asset.buy_price
-  const estimatedMarketValue = (asset: Asset) => asset.shares * effectivePrice(asset)
+  const hasValidCurrentPrice = (asset: Asset) => asset.current_price != null && toFiniteNumber(asset.current_price) > 0
+  const effectivePrice = (asset: Asset) => hasValidCurrentPrice(asset) ? toFiniteNumber(asset.current_price) : toFiniteNumber(asset.buy_price)
+  const estimatedMarketValue = (asset: Asset) => toFiniteNumber(asset.shares) * effectivePrice(asset)
   const overviewAssets = useMemo(() => {
     return [...assets]
-      .filter(asset => (asset.shares || 0) > 0)
+      .filter(asset => toFiniteNumber(asset.shares) > 0)
       .sort((a, b) => {
         const byValue = estimatedMarketValue(b) - estimatedMarketValue(a)
         if (byValue !== 0) return byValue
@@ -558,14 +578,25 @@ export default function Dashboard() {
     )
   }
 
-  const isPositive = (dashboard?.total_pnl ?? 0) >= 0
+  const totalMarketValue = toFiniteNumber(dashboard?.total_market_value)
+  const totalCost = toFiniteNumber(dashboard?.total_cost)
+  const totalPnl = toFiniteNumber(dashboard?.total_pnl)
+  const totalPnlPercent = toFiniteNumber(dashboard?.total_pnl_percent)
+  const realizedPnl = toFiniteNumber(dashboard?.realized_pnl)
+  const isEmptyPortfolio = totalCost <= 0 && overviewAssets.length === 0
+  const analysisMarketValue = toFiniteNumber(analysis?.total_market_value)
+  const analysisTotalCost = toFiniteNumber(analysis?.total_cost)
+  const analysisTotalPnl = toFiniteNumber(analysis?.total_pnl)
+  const analysisPnlPercent = toFiniteNumber(analysis?.total_pnl_percent)
+
+  const isPositive = totalPnl >= 0
   const pnlColor = isPositive ? greenStyle.color : redStyle.color
   const ArrowIcon = isPositive ? ArrowUpOutlined : ArrowDownOutlined
 
   const statCards = [
     {
       title: '持仓市值',
-      value: dashboard?.total_market_value ?? 0,
+      value: totalMarketValue,
       precision: 2,
       prefix: <DollarOutlined style={{ ...goldStyle, fontSize: 20 }} />,
       suffix: '¥',
@@ -573,7 +604,7 @@ export default function Dashboard() {
     },
     {
       title: '持仓成本',
-      value: dashboard?.total_cost ?? 0,
+      value: totalCost,
       precision: 2,
       prefix: <WalletOutlined style={{ ...goldStyle, fontSize: 20 }} />,
       suffix: '¥',
@@ -581,17 +612,17 @@ export default function Dashboard() {
     },
     {
       title: '浮动盈亏',
-      value: dashboard?.total_pnl ?? 0,
+      value: totalPnl,
       precision: 2,
       prefix: <ArrowIcon style={{ color: pnlColor, fontSize: 20 }} />,
       suffix: '¥',
       valueStyle: { color: pnlColor },
-      extra: `(${isPositive ? '+' : ''}${dashboard?.total_pnl_percent?.toFixed(2)}%)`,
+      extra: `(${isPositive ? '+' : ''}${totalPnlPercent.toFixed(2)}%)`,
       icon: <ArrowIcon />,
     },
     {
       title: '已实现盈亏',
-      value: dashboard?.realized_pnl ?? 0,
+      value: realizedPnl,
       precision: 2,
       prefix: <RiseOutlined style={{ ...goldStyle, fontSize: 20 }} />,
       suffix: '¥',
@@ -645,7 +676,7 @@ export default function Dashboard() {
         if (!hasValidCurrentPrice(r)) {
           return <span style={{ color: '#5c5a55', fontWeight: 500 }}>暂无行情</span>
         }
-        const pnl = r.shares * (effectivePrice(r) - r.buy_price)
+        const pnl = toFiniteNumber(r.shares) * (effectivePrice(r) - toFiniteNumber(r.buy_price))
         const color = pnl > 0 ? greenStyle.color : pnl < 0 ? redStyle.color : '#9a9892'
         return (
           <span style={{ color, fontWeight: 600 }}>
@@ -673,7 +704,7 @@ export default function Dashboard() {
             onClick={runAnalysis}
             style={{ borderRadius: 10, fontWeight: 600, height: 44, paddingInline: 28, fontSize: 15 }}
           >
-            {aiCtx.state.isRunning ? '分析中...' : '一键 AI 分析'}
+            {aiCtx.state.isRunning ? '分析中...' : isEmptyPortfolio ? '一键 AI 建仓' : '一键 AI 分析'}
           </Button>
           <Space>
             <Switch
@@ -695,7 +726,9 @@ export default function Dashboard() {
           </Space>
         </Space>
         <Text style={{ color: '#5c5a55', fontSize: 12 }}>
-          {includeTargets && includeAdvice
+          {isEmptyPortfolio
+            ? '空仓建仓：推荐标的 → 投资建议'
+            : includeTargets && includeAdvice
             ? '分析 → 推荐标的 → 投资建议'
             : includeTargets
             ? '分析完成后将自动更新标的推荐'
@@ -818,11 +851,11 @@ export default function Dashboard() {
                     fontSize: 12,
                     color: '#5c5a55',
                   }}>
-                    <span>市值 <strong style={{ color: '#9a9892' }}>¥{analysis.total_market_value.toFixed(2)}</strong></span>
-                    <span>成本 <strong style={{ color: '#9a9892' }}>¥{analysis.total_cost.toFixed(2)}</strong></span>
+                    <span>市值 <strong style={{ color: '#9a9892' }}>¥{analysisMarketValue.toFixed(2)}</strong></span>
+                    <span>成本 <strong style={{ color: '#9a9892' }}>¥{analysisTotalCost.toFixed(2)}</strong></span>
                     <span>盈亏 <strong style={{
-                      color: analysis.total_pnl >= 0 ? greenStyle.color : redStyle.color,
-                    }}>{analysis.total_pnl >= 0 ? '+' : ''}{analysis.total_pnl_percent.toFixed(2)}%</strong></span>
+                      color: analysisTotalPnl >= 0 ? greenStyle.color : redStyle.color,
+                    }}>{analysisTotalPnl >= 0 ? '+' : ''}{analysisPnlPercent.toFixed(2)}%</strong></span>
                   </div>
                 </div>
               </div>
@@ -837,7 +870,7 @@ export default function Dashboard() {
                   暂无分析报告
                 </div>
                 <div style={{ fontSize: 13 }}>
-                  点击上方「一键 AI 分析」按钮开始分析您的投资组合
+                  {isEmptyPortfolio ? '点击上方「一键 AI 建仓」按钮开始推荐标的和生成投资建议' : '点击上方「一键 AI 分析」按钮开始分析您的投资组合'}
                 </div>
               </div>
             )}

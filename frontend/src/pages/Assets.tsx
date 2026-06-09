@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
   Card, Table, Button, Modal, Form, Input, InputNumber, Space,
@@ -17,7 +17,8 @@ import {
 } from 'recharts'
 import {
   assetsApi, marketApi, analysisApi, Asset, AssetDetail,
-  AssetTransaction, MarketFundamentals, MarketHistoryItem, transformMarketHistory
+  AssetTransaction, MarketFundamentals, MarketHistoryItem, transformMarketHistory,
+  type AssetScope,
 } from '../api'
 import { NetValueRangeSelector, type NetValuePeriod } from '../components/MarketCharts'
 
@@ -44,6 +45,12 @@ const groupOptions = [
   { label: '按平台', value: 'platform' },
 ]
 
+const assetScopeOptions = [
+  { label: '全部资产', value: 'all' },
+  { label: '手动资产', value: 'manual' },
+  { label: 'AI 建仓', value: 'ai_advice' },
+]
+
 const platformOptions = [
   { value: '微信理财通' },
   { value: '支付宝' },
@@ -68,6 +75,12 @@ const marketTagColors: Record<string, string> = {
   HK: '#e8d48b',
   US: '#a0893c',
 }
+
+const assetSourceLabel = (source?: string) => source === 'ai_advice' ? 'AI 建仓' : '手动资产'
+const assetSourceColor = (source?: string) => source === 'ai_advice' ? '#7c8cff' : '#c9a84c'
+const assetInScope = (asset: Asset, scope: AssetScope) => (
+  scope === 'all' || (scope === 'ai_advice' ? asset.source === 'ai_advice' : asset.source !== 'ai_advice')
+)
 
 const fundamentalLabels: Record<keyof MarketFundamentals, string> = {
   market_cap: '总市值',
@@ -212,6 +225,7 @@ export default function Assets() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingAsset, setEditingAsset] = useState<Asset | null>(null)
   const [groupBy, setGroupBy] = useState<'type' | 'platform'>('type')
+  const [assetScope, setAssetScope] = useState<AssetScope>('all')
   const [form] = Form.useForm()
   const [tradeForm] = Form.useForm()
   const [detailOpen, setDetailOpen] = useState(false)
@@ -223,7 +237,7 @@ export default function Assets() {
   const [detailFundamentalsLoading, setDetailFundamentalsLoading] = useState(false)
   const [transactionModalOpen, setTransactionModalOpen] = useState(false)
   const [savingTransaction, setSavingTransaction] = useState(false)
-  const [assetListPeriod, setAssetListPeriod] = useState<NetValuePeriod>('1m')
+  const assetListPeriod: NetValuePeriod = '1m'
   const [detailPeriod, setDetailPeriod] = useState<NetValuePeriod>('6m')
 
   const lastAutoNameRef = useRef<string | null>(null)
@@ -262,6 +276,16 @@ export default function Assets() {
   useEffect(() => {
     assetsRef.current = assets
   }, [assets])
+
+  const visibleAssets = useMemo(() => (
+    assets.filter(asset => assetInScope(asset, assetScope))
+  ), [assets, assetScope])
+
+  const assetScopeCounts = useMemo(() => ({
+    all: assets.length,
+    manual: assets.filter(asset => asset.source !== 'ai_advice').length,
+    ai_advice: assets.filter(asset => asset.source === 'ai_advice').length,
+  }), [assets])
 
   const idleDelay = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
 
@@ -367,14 +391,14 @@ export default function Assets() {
   const aiCtx = useAIWorkContext()
 
   const handleAnalyzeAll = async () => {
-    if (assets.length === 0) {
+    if (visibleAssets.length === 0) {
       aiCtx.startTask('AI 全面分析')
-      aiCtx.failTask('暂无资产需要分析')
+      aiCtx.failTask('当前资产空间暂无资产需要分析')
       return
     }
     aiCtx.startTask('AI 全面分析')
     try {
-      const ids = assets.map(a => a.id)
+      const ids = visibleAssets.map(a => a.id)
       const totalAssets = ids.length
       const batchSize = Math.min(3, Math.max(1, Math.ceil(totalAssets / 3)))
       const batches: number[][] = []
@@ -449,9 +473,9 @@ export default function Assets() {
 
   useEffect(() => {
     if (assets.length > 0) {
-      fetchPriceHistory(assets, assetListPeriod)
+      fetchPriceHistory(visibleAssets, assetListPeriod)
     }
-  }, [assetListPeriod])
+  }, [assetListPeriod, visibleAssets])
 
   const openAddModal = () => {
     setEditingAsset(null)
@@ -798,6 +822,20 @@ export default function Assets() {
     },
     { title: '平台', dataIndex: 'platform', key: 'platform', width: 85 },
     {
+      title: '资产空间', dataIndex: 'source', key: 'source', width: 90,
+      render: (v: string) => (
+        <Tag style={{
+          borderRadius: 6,
+          border: `1px solid ${assetSourceColor(v)}`,
+          color: assetSourceColor(v),
+          background: 'transparent',
+          margin: 0,
+        }}>
+          {assetSourceLabel(v)}
+        </Tag>
+      ),
+    },
+    {
       title: '份额', dataIndex: 'shares', key: 'shares', width: 75,
       render: (v: number) => <span style={{ fontWeight: 500 }}>{v.toFixed(2)}</span>,
     },
@@ -923,7 +961,7 @@ export default function Assets() {
   const groupedData = () => {
     const groups: Record<string, Asset[]> = {}
     const key = groupBy === 'type' ? 'asset_type' : 'platform'
-    assets.forEach(a => {
+    visibleAssets.forEach(a => {
       const g = key === 'asset_type' ? (assetTypeMap[a[key]] || a[key]) : (a[key] || '其他')
       if (!groups[g]) groups[g] = []
       groups[g].push(a)
@@ -934,7 +972,7 @@ export default function Assets() {
   const tableProps = {
     rowKey: "id" as const,
     loading,
-    scroll: { x: 1480 } as const,
+    scroll: { x: 1570 } as const,
     size: "small" as const,
     style: { margin: -4 } as const,
     components: {
@@ -1309,8 +1347,17 @@ export default function Assets() {
         }
         extra={
           <Space>
-            <Text style={{ color: '#9a9892', fontSize: 12 }}>时间段</Text>
-            <NetValueRangeSelector value={assetListPeriod} onChange={setAssetListPeriod} />
+            <Radio.Group
+              options={assetScopeOptions.map(option => ({
+                ...option,
+                label: `${option.label} ${assetScopeCounts[option.value as AssetScope]}`,
+              }))}
+              value={assetScope}
+              onChange={e => setAssetScope(e.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              size="small"
+            />
             <Button
               icon={<ThunderboltOutlined />}
               onClick={handleAnalyzeAll}
@@ -1351,7 +1398,7 @@ export default function Assets() {
         <div style={{ padding: 16 }}>
           {groupBy === 'type' ? (
             <Table
-              dataSource={assets}
+              dataSource={visibleAssets}
               columns={columns}
               pagination={{
                 pageSize: 20,

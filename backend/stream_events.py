@@ -67,6 +67,7 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     system_prompt = build_system_prompt(personality, report_style)
     client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     from ai_service import (
+        empty_portfolio_analysis_report,
         coerce_ai_report_fields, openai_error_detail, openai_runtime_summary, parse_ai_json_object,
         sanitize_ai_payload, strip_model_thinking, text_report_fallback,
     )
@@ -75,13 +76,36 @@ def stream_portfolio_analysis(db: Session) -> Generator[str, None, None]:
     # Stage 1: Load assets (slow start)
     yield sse_event("log", {"message": f"当前 AI 配置：{runtime_summary}", "tag": "配置"})
     yield sse_event("log", {"message": "正在加载资产数据...", "tag": "加载"})
-    assets = db.query(Asset).all()
+    assets = [a for a in db.query(Asset).all() if (a.shares or 0) > 0]
     yield sse_event("log", {"message": f"已加载 {len(assets)} 项持仓资产", "tag": "加载"})
     yield sse_event("progress", {"progress": 5})
 
     if not assets:
-        yield sse_event("log", {"message": "没有资产需要分析", "tag": "加载"})
-        yield sse_event("complete", {"summary": "无资产", "detail": "暂无持仓数据"})
+        report = empty_portfolio_analysis_report()
+        record = AnalysisRecord(
+            summary=report["summary"],
+            detail=report["detail"],
+            total_market_value=0,
+            total_cost=0,
+            total_pnl=0,
+            total_pnl_percent=0,
+            realized_pnl=0,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        yield sse_event("log", {"message": "当前为空仓，已切换到 AI 建仓模式", "tag": "建仓"})
+        yield sse_event("complete", {
+            "id": record.id,
+            "summary": report["summary"],
+            "detail": report["detail"],
+            "total_market_value": 0,
+            "total_cost": 0,
+            "total_pnl": 0,
+            "total_pnl_percent": 0,
+            "realized_pnl": 0,
+            "created_at": record.created_at.isoformat() if hasattr(record.created_at, 'isoformat') else str(record.created_at),
+        })
         return
 
     # Calculate totals
@@ -320,7 +344,7 @@ def stream_target_analysis(db: Session, markets: list[str] = None, asset_types: 
         yield sse_event("error", {"detail": f"标的分析失败: {detail}"})
 
 
-def stream_investment_advice(db: Session) -> Generator[str, None, None]:
+def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator[str, None, None]:
     """SSE generator for investment advice with real streaming."""
     api_key = get_setting(db, "openai_api_key")
     if not api_key:
@@ -340,19 +364,23 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         _load_investment_budgets, _investment_budget_status,
         _candidate_investment_targets, _read_providers,
         _latest_today_asset_analysis, _build_investment_advice_prompt,
+        _normalize_asset_scope, _asset_scope_label, _filter_assets_by_scope,
     )
+    asset_scope = _normalize_asset_scope(asset_scope, "all")
     budgets = _load_investment_budgets(db)
     if not budgets:
         yield sse_event("error", {"detail": "请先在设置页面配置平台投资额度"})
         return
 
-    assets = db.query(Asset).all()
+    all_assets = db.query(Asset).all()
+    assets = _filter_assets_by_scope(all_assets, asset_scope)
     providers = _read_providers(db)
 
     yield sse_event("log", {"message": f"已加载 {len(budgets)} 个平台额度配置", "tag": "配置"})
+    yield sse_event("log", {"message": f"本次建议范围：{_asset_scope_label(asset_scope)}，持仓候选 {len(assets)} 项", "tag": "配置"})
     yield sse_event("progress", {"progress": 10})
 
-    budget_status = _investment_budget_status(budgets, assets)
+    budget_status = _investment_budget_status(budgets, all_assets)
 
     yield sse_event("thinking", {"message": "正在并行获取持仓与标的最新行情..."})
     yield sse_event("progress", {"progress": 13})
@@ -375,6 +403,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         asset_items,
         target_items,
         today_analysis,
+        asset_scope,
     )
     yield sse_event("progress", {"progress": 30})
 
@@ -423,6 +452,7 @@ def stream_investment_advice(db: Session) -> Generator[str, None, None]:
         result = _normalize_investment_advice(
             raw, budgets, assets, target_items, budget_status, market_snapshot,
             diagnostics=diagnostics,
+            asset_scope=asset_scope,
         )
 
         final_advice = result.get('advice', []) or []

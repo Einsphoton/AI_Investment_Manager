@@ -189,6 +189,23 @@ def text_report_fallback(content: str, default_summary: str = "AI 分析完成")
     return {"summary": summary or default_summary, "detail": text}
 
 
+def empty_portfolio_analysis_report() -> dict:
+    return {
+        "summary": "空仓建仓模式已启动",
+        "detail": (
+            "## 空仓建仓模式\n\n"
+            "当前没有可分析的持仓资产，本次一键 AI 分析将不再按持仓复盘处理，而是进入建仓流程。\n\n"
+            "### 下一步\n"
+            "- 先由 AI 推荐 3-5 个候选标的，形成可持续维护的标的池。\n"
+            "- 如果已配置平台投资额度，系统会继续基于标的池、额度和行情生成分批买入建议。\n"
+            "- 采纳买入建议后，资产会以 AI 建议来源写入持仓，后续继续由 AI 跟踪和再平衡。\n\n"
+            "### 风险控制\n"
+            "- 空仓建仓会优先采用小步分批方式，不默认一次性用完整个平台额度。\n"
+            "- 行情或基本面数据不足时，投资建议可能为空，需要先完善数据源或放宽推荐范围。"
+        ),
+    }
+
+
 def run_ai_analysis(db: Session) -> AnalysisRecord:
     api_key = get_setting(db, "openai_api_key")
     base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
@@ -202,11 +219,27 @@ def run_ai_analysis(db: Session) -> AnalysisRecord:
     from agent.personality import build_system_prompt
     system_prompt = build_system_prompt(personality, report_style)
 
-    assets = db.query(Asset).all()
+    assets = [a for a in db.query(Asset).all() if (a.shares or 0) > 0]
     total_cost = sum(a.shares * a.buy_price for a in assets)
     total_market_value = sum(a.shares * (a.current_price or a.buy_price) for a in assets)
     total_pnl = total_market_value - total_cost
     total_pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+
+    if not assets:
+        report = empty_portfolio_analysis_report()
+        record = AnalysisRecord(
+            summary=report["summary"],
+            detail=report["detail"],
+            total_market_value=0,
+            total_cost=0,
+            total_pnl=0,
+            total_pnl_percent=0,
+            realized_pnl=0,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record
 
     from data_source import get_fundamentals
     providers = {}

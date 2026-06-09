@@ -758,7 +758,7 @@ def _run_compact_asset_ai_analysis(
         personality=personality,
         report_style=report_style,
     )
-    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=90)
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
     compact_assets = _compact_asset_context(asset_data, fundamentals_map, history_map)
     prompt = f"""{ctx.system_prompt}
 
@@ -2606,7 +2606,7 @@ def run_investment_advice(db: Session = Depends(get_db)):
         personality=personality,
         report_style=report_style,
     )
-    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=90)
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=300)
 
     prompt, market_snapshot = _build_investment_advice_prompt(
         ctx.system_prompt,

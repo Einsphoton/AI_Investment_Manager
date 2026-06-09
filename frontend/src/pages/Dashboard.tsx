@@ -238,12 +238,29 @@ export default function Dashboard() {
   }
 
   const runAssetDetailAnalysis = async () => {
-    if (assets.length === 0) return
-    await analysisApi.agentRun({
-      asset_ids: assets.map(asset => asset.id),
-      goal: '请为当前全部持仓生成用于资产详情页展示的逐项 AI 分析报告。每项资产都要覆盖宏观影响、微观因素、基本面、技术面、风险提示和具体操作建议。',
-      save_portfolio_record: false,
-    })
+    if (assets.length === 0) {
+      console.warn('[Dashboard] assets is empty, skipping asset detail analysis')
+      return
+    }
+    // 逐个资产分析，避免单次 AI 请求因超时或代理断开而整体失败
+    let succeeded = 0
+    let failed = 0
+    for (const asset of assets) {
+      try {
+        await analysisApi.agentRun({
+          asset_ids: [asset.id],
+          goal: `请针对 ${asset.name || asset.code} 这一项资产生成详细分析报告，覆盖基本面、技术面交易策略、具体交易建议、宏观信息和微观信息。`,
+          save_portfolio_record: false,
+        })
+        succeeded++
+      } catch (e: any) {
+        failed++
+        console.error(`[Dashboard] asset analysis failed for ${asset.code}:`, e)
+      }
+    }
+    if (failed > 0) {
+      aiCtx.addLog(`⚠️ 资产详情分析完成 ${succeeded} 项，${failed} 项失败`, 'warning', '资产分析')
+    }
   }
 
   const runAnalysis = async () => {

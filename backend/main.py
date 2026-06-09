@@ -830,6 +830,8 @@ def _run_compact_asset_ai_analysis(
                 {"role": "user", "content": prompt},
             ],
         )
+        if not resp.choices:
+            raise ValueError("AI 返回了空响应 (choices 为空)")
         raw = parse_ai_json_object(resp.choices[0].message.content)
         raw = sanitize_ai_payload(raw)
     except Exception as e:
@@ -2622,6 +2624,8 @@ def run_investment_advice(db: Session = Depends(get_db)):
                 {"role": "user", "content": prompt},
             ],
         )
+        if not resp.choices:
+            raise ValueError("AI 返回了空响应 (choices 为空)")
         raw = parse_ai_json_object(resp.choices[0].message.content)
         raw = sanitize_ai_payload(raw)
     except Exception as e:

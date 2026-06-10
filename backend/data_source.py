@@ -220,7 +220,8 @@ def _sina_stock_quote(code: str, market: str) -> Optional[dict]:
         if not m:
             return None
         parts = m.group(1).split(',')
-        if len(parts) < 32:
+        min_fields = 6 if market == 'HK' else 32
+        if len(parts) < min_fields:
             return None
         name = parts[0]
         current = parse_float(parts[3])
@@ -256,6 +257,8 @@ def _tencent_stock_quote(code: str, market: str) -> Optional[dict]:
         return {
             'name': name, 'code': code, 'market': market,
             'current_price': current, 'prev_close': prev_close,
+            'change': round(current - prev_close, 3) if (current is not None and prev_close is not None) else None,
+            'change_pct': round((current - prev_close) / prev_close * 100, 2) if (current and prev_close) else None,
         }
     except Exception as e:
         print(f"[Tencent] {code}: {e}")

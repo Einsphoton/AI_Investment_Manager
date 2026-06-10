@@ -153,6 +153,10 @@ export default function InvestmentAdvice() {
     try {
       await investmentAdviceApi.accept(item)
       setStatuses(prev => ({ ...prev, [item.id]: 'accepted' }))
+      setResult(prev => prev ? {
+        ...prev,
+        advice: prev.advice.filter(advice => advice.id !== item.id),
+      } : prev)
       message.success(`已采纳并写入${adviceAssetSourceLabel(item, result?.asset_scope)}`)
       // Refresh budget status
       loadBudgetStatus()

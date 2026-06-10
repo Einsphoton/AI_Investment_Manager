@@ -3270,6 +3270,47 @@ def _find_asset_for_advice(db: Session, advice: dict) -> Asset | None:
     return next((asset for asset in assets if _analysis_code_key(asset.code) == code), None)
 
 
+def _investment_advice_match_key(advice: dict) -> tuple:
+    return (
+        str(advice.get("id") or "").strip(),
+        _analysis_code_key(advice.get("code") or advice.get("asset_code") or ""),
+        str(advice.get("trade_type") or "").strip().upper(),
+        str(advice.get("budget_id") or "").strip(),
+        str(advice.get("platform") or "").strip(),
+        str(advice.get("market") or "").strip().upper(),
+        str(advice.get("asset_type") or "").strip(),
+        _normalize_asset_scope(advice.get("asset_source") or advice.get("asset_scope"), "all"),
+    )
+
+
+def _remove_latest_pending_investment_advice(db: Session, advice: dict) -> tuple[object, list[dict]]:
+    from models import InvestmentAdviceRecord
+
+    record = db.query(InvestmentAdviceRecord).order_by(InvestmentAdviceRecord.created_at.desc()).first()
+    if not record:
+        raise HTTPException(status_code=409, detail="该投资建议记录不存在，请重新生成建议")
+
+    items = _safe_json_loads(record.advice_json, [])
+    if not isinstance(items, list):
+        items = []
+
+    target_key = _investment_advice_match_key(advice)
+    remaining: list[dict] = []
+    matched = False
+    for item in items:
+        if isinstance(item, dict) and not matched and _investment_advice_match_key(item) == target_key:
+            matched = True
+            continue
+        if isinstance(item, dict):
+            remaining.append(item)
+
+    if not matched:
+        raise HTTPException(status_code=409, detail="该建议已被处理或不是最新建议，请重新生成后再采纳")
+
+    record.advice_json = json.dumps(remaining, ensure_ascii=False, default=str)
+    return record, remaining
+
+
 @app.post("/api/investment-advice/accept")
 def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = Depends(get_db)):
     advice = req.advice or {}
@@ -3281,6 +3322,8 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
     price = _normalize_ai_number(advice.get("price"), 0)
     if shares <= 0 or price <= 0:
         raise HTTPException(status_code=400, detail="交易份额和价格必须大于 0")
+
+    _, remaining_advice = _remove_latest_pending_investment_advice(db, advice)
 
     budgets = _load_investment_budgets(db)
     assets = db.query(Asset).all()
@@ -3391,6 +3434,7 @@ def accept_investment_advice(req: InvestmentAdviceAcceptRequest, db: Session = D
         "message": "已采纳投资建议并写入交易",
         "asset": AssetResponse.model_validate(asset),
         "transaction": AssetTransactionResponse.model_validate(db_transaction),
+        "remaining_advice_count": len(remaining_advice),
     }
 
 

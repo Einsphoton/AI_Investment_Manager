@@ -27,6 +27,12 @@ def _migrate():
     for table, col_defs in [
         ("analysis_records", [("asset_id", "INTEGER REFERENCES assets(id)")]),
         ("assets", [("source", "VARCHAR(20) DEFAULT 'manual'")]),
+        ("ipo_analysis_records", [
+            ("markets", "VARCHAR(50) DEFAULT ''"),
+            ("items_json", "TEXT DEFAULT '[]'"),
+            ("result_json", "TEXT DEFAULT '{}'"),
+            ("source_status_json", "TEXT DEFAULT '{}'"),
+        ]),
     ]:
         existing = {c["name"] for c in inspector.get_columns(table)}
         for col_name, col_type in col_defs:

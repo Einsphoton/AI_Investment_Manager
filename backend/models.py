@@ -100,6 +100,26 @@ class InvestmentAdviceRecord(Base):
     budget_status_json = Column(Text, default="[]")
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class IPOAnalysisRecord(Base):
+    __tablename__ = "ipo_analysis_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String(20), default="", nullable=False)
+    name = Column(String(100), default="")
+    market = Column(String(10), default="", nullable=False)
+    analysis_json = Column(Text, default="{}")
+    summary = Column(Text, default="")
+    win_rate = Column(Float, default=0.0)
+    expected_profit = Column(Float, default=0.0)
+    recommendation = Column(String(20), default="")
+    markets = Column(String(50), default="")
+    items_json = Column(Text, default="[]")
+    result_json = Column(Text, default="{}")
+    source_status_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class RecommendationSnapshot(Base):
     __tablename__ = "recommendation_snapshots"
 

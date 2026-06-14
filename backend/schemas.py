@@ -219,6 +219,37 @@ class InvestmentAdviceResponse(BaseModel):
     asset_scope_label: str = "全部资产"
 
 
+class IPOListRequest(BaseModel):
+    markets: list[str] = ["A", "HK", "US"]
+    limit: int = Field(30, ge=1, le=100)
+    force_refresh: bool = False
+
+
+class IPOAnalysisRequest(BaseModel):
+    markets: list[str] = ["A", "HK", "US"]
+    ipo_ids: list[str] = []
+    items: list[dict] = []
+    source_status: dict = {}
+    limit: int = Field(30, ge=1, le=100)
+    force_refresh: bool = False
+
+
+class IPOListResponse(BaseModel):
+    items: list[dict] = []
+    source_status: dict = {}
+    providers: dict = {}
+    generated_at: str = ""
+
+
+class IPOAnalysisResponse(BaseModel):
+    summary: str = ""
+    analyses: list[dict] = []
+    market_view: dict = {}
+    data_quality: dict = {}
+    source_status: dict = {}
+    generated_at: str = ""
+
+
 class AIChatMessage(BaseModel):
     role: str
     content: str

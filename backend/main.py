@@ -22,7 +22,10 @@ from apscheduler.triggers.cron import CronTrigger
 from openai import OpenAI
 
 from database import get_db, init_db, SessionLocal
-from models import Asset, AssetTransaction, AnalysisRecord, Settings, Target, InstalledSkill
+from models import (
+    Asset, AssetTransaction, AnalysisRecord, Settings, Target, InstalledSkill,
+    InvestmentAdviceRecord, IPOAnalysisRecord, RecommendationSnapshot,
+)
 from schemas import (
     AssetCreate, AssetUpdate, AssetResponse,
     AssetDetailResponse, AssetTransactionCreate, AssetTransactionResponse,
@@ -32,6 +35,7 @@ from schemas import (
     AgentAnalysisRequest, AgentAnalysisResponse, AIRecommendConfig,
     AIChatRequest, AIChatResponse, AIChatContextResponse,
     InvestmentAdviceAcceptRequest, InvestmentAdviceResponse,
+    IPOAnalysisRequest, IPOAnalysisResponse, IPOListRequest, IPOListResponse,
     MarketLookupRequest, MarketLookupResponse,
     MarketQuoteRequest, MarketQuoteResponse,
     MarketSearchRequest, MarketSearchResponse, MarketSearchItem,
@@ -51,6 +55,10 @@ from ai_service import (
     strip_model_thinking,
 )
 from data_source import lookup_name, get_quote, get_history, get_fundamentals, search, PROVIDER_LABELS, STOCK_PROVIDER_OPTIONS, FUND_PROVIDER_OPTIONS
+from ipo_data_source import (
+    fetch_ipo_list, IPO_PROVIDER_LABELS, IPO_PROVIDER_OPTIONS, DEFAULT_IPO_PROVIDERS,
+    EASTMONEY_HK_IPO, AASTOCKS_HK_IPO,
+)
 from ocr_service import parse_image
 from agent import AgentHarness
 from agent.skill import SkillContext
@@ -77,6 +85,11 @@ def _get_scheduler_config(db: Session) -> dict:
     markets_str = get_setting(db, "auto_analyze_markets") or ""
     markets = [m.strip() for m in markets_str.split(",") if m.strip()] if markets_str else []
     include_targets = get_setting(db, "auto_analyze_include_targets") == "true"
+    portfolio_enabled = get_setting(db, "auto_analyze_include_portfolio") != "false"
+    investment_advice_enabled = get_setting(db, "auto_analyze_include_investment_advice") == "true"
+    ipo_enabled = get_setting(db, "auto_analyze_include_ipo") == "true"
+    ipo_markets_str = get_setting(db, "auto_analyze_ipo_markets") or ""
+    ipo_markets = [m.strip() for m in ipo_markets_str.split(",") if m.strip()] if ipo_markets_str else []
     return {
         "enabled": enabled,
         "interval_type": interval_type,
@@ -84,6 +97,10 @@ def _get_scheduler_config(db: Session) -> dict:
         "daily_time": daily_time,
         "markets": markets,
         "include_targets": include_targets,
+        "include_portfolio": portfolio_enabled,
+        "include_investment_advice": investment_advice_enabled,
+        "include_ipo": ipo_enabled,
+        "ipo_markets": ipo_markets,
     }
 
 
@@ -182,16 +199,62 @@ def scheduled_analysis():
         cfg = _get_scheduler_config(db)
         if not cfg["enabled"]:
             return
-        if db.query(Asset).count() == 0:
-            return
         if cfg["markets"] and not is_trading_day(cfg["markets"]):
             return
-        refresh_market_data(db, force_refresh=True, blocking=True)
-        run_ai_analysis(db)
+        has_assets = db.query(Asset).count() > 0
+        if has_assets:
+            refresh_market_data(db, force_refresh=True, blocking=True)
+        if cfg.get("include_portfolio", True) and has_assets:
+            try:
+                run_ai_analysis(db)
+            except Exception as exc:
+                print(f"[ScheduledAnalysis] portfolio failed: {exc}")
         if cfg["include_targets"]:
-            _run_scheduled_target_analysis(db)
+            try:
+                _run_scheduled_target_analysis(db)
+            except Exception as exc:
+                print(f"[ScheduledAnalysis] targets failed: {exc}")
+        if cfg.get("include_investment_advice"):
+            try:
+                _run_scheduled_investment_advice(db)
+            except Exception as exc:
+                print(f"[ScheduledAnalysis] investment advice failed: {exc}")
+        if cfg.get("include_ipo"):
+            try:
+                _run_scheduled_ipo_analysis(db, cfg.get("ipo_markets") or cfg.get("markets") or ["A", "HK", "US"])
+            except Exception as exc:
+                print(f"[ScheduledAnalysis] IPO failed: {exc}")
     finally:
         db.close()
+
+
+def _run_scheduled_investment_advice(db: Session):
+    try:
+        budgets = _load_investment_budgets(db)
+    except Exception:
+        budgets = []
+    if not budgets:
+        print("[ScheduledAnalysis] investment advice skipped: no budget config")
+        return None
+    return run_investment_advice(asset_scope="all", db=db)
+
+
+def _run_scheduled_ipo_analysis(db: Session, markets: list[str] | None = None):
+    market_list = [m for m in (markets or []) if m in {"A", "HK", "US"}] or ["A", "HK", "US"]
+    providers = _read_ipo_providers(db)
+    data = fetch_ipo_list(market_list, providers, limit=40, force_refresh=True)
+    items = data.get("items") or []
+    if not items:
+        print("[ScheduledAnalysis] IPO skipped: no open IPO items")
+        return None
+    result = _run_ipo_ai_analysis(db, items, data.get("source_status", {}))
+    payload = {
+        **result,
+        "source_status": data.get("source_status", {}),
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_ipo_analysis_record(db, market_list, items, payload)
+    return payload
 
 
 def _run_scheduled_target_analysis(db: Session):
@@ -2047,6 +2110,8 @@ def update_settings(key: str, data: SettingsUpdate, db: Session = Depends(get_db
         "auto_analyze_enabled", "auto_analyze_interval_type",
         "auto_analyze_interval_value", "auto_analyze_time",
         "auto_analyze_markets", "auto_analyze_include_targets",
+        "auto_analyze_include_portfolio", "auto_analyze_include_investment_advice",
+        "auto_analyze_include_ipo", "auto_analyze_ipo_markets",
     }
     if key in scheduler_keys:
         reschedule_analysis(db)
@@ -2117,6 +2182,375 @@ def _read_providers(db: Session) -> dict:
             market = key.split('_')[-1]
             providers['fund'][market] = val
     return providers
+
+
+def _read_ipo_providers(db: Session) -> dict:
+    providers: dict[str, str] = {}
+    for market in ["A", "HK", "US"]:
+        val = get_setting(db, f"datasource_ipo_{market}")
+        if market == "HK" and val == EASTMONEY_HK_IPO:
+            val = AASTOCKS_HK_IPO
+        providers[market] = val or DEFAULT_IPO_PROVIDERS.get(market, "")
+    return providers
+
+
+def _ipo_market_label(market: str) -> str:
+    return {"A": "A股", "HK": "港股", "US": "美股"}.get(market, market)
+
+
+def _ipo_status_label(status: str) -> str:
+    return {
+        "upcoming": "即将申购",
+        "subscribing": "申购中/待上市",
+        "listed": "已上市",
+    }.get(status or "", status or "未知")
+
+
+def _clip_text(value, limit: int = 240) -> str:
+    text = strip_model_thinking(str(value or "")).strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _fallback_ipo_analysis(items: list[dict], reason: str = "") -> dict:
+    analyses = []
+    for item in items:
+        issue_pe = _normalize_ai_number(item.get("issue_pe"), 0)
+        industry_pe = _normalize_ai_number(item.get("industry_pe"), 0)
+        subscription_multiple = _normalize_ai_number(item.get("subscription_multiple"), 0)
+        score = 50
+        evidence = []
+        risk_flags = []
+
+        if issue_pe and industry_pe:
+            pe_ratio = issue_pe / industry_pe if industry_pe else 1
+            if pe_ratio < 0.8:
+                score += 14
+                evidence.append(f"发行 PE 低于行业参考，估值折价约 {(1 - pe_ratio) * 100:.1f}%")
+            elif pe_ratio > 1.2:
+                score -= 16
+                risk_flags.append(f"发行 PE 高于行业参考，溢价约 {(pe_ratio - 1) * 100:.1f}%")
+            else:
+                evidence.append("发行 PE 与行业参考接近")
+        else:
+            score -= 4
+            risk_flags.append("估值对比数据不完整")
+
+        if subscription_multiple:
+            if subscription_multiple > 500:
+                score += 8
+                evidence.append("申购倍数较高，市场参与热度较强")
+            elif subscription_multiple < 50:
+                score -= 6
+                risk_flags.append("申购倍数偏低，热度一般")
+
+        market = item.get("market")
+        if market == "A":
+            score += 6
+            evidence.append("A 股新股短期破发概率通常受发行估值、板块热度和市场环境影响")
+        elif market == "HK":
+            score -= 2
+            risk_flags.append("港股新股受暗盘情绪、基石质量和流动性影响较大")
+        elif market == "US":
+            score -= 3
+            risk_flags.append("美股 IPO 对利率、成长股风险偏好和承销定价更敏感")
+
+        score = max(20, min(86, score))
+        expected_profit_pct = round((score - 50) * 0.45, 2)
+        if score >= 68:
+            recommendation = "SUBSCRIBE"
+            action = "可以参与打新，但建议控制单票资金占用。"
+        elif score >= 52:
+            recommendation = "WATCH"
+            action = "可小仓位或等待定价、中签率、市场情绪进一步确认。"
+        else:
+            recommendation = "AVOID"
+            action = "暂不建议参与，除非后续定价或市场热度明显改善。"
+
+        analyses.append({
+            "ipo_id": item.get("id"),
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "market_label": _ipo_market_label(str(item.get("market") or "")),
+            "recommendation": recommendation,
+            "recommendation_label": {"SUBSCRIBE": "建议申购", "WATCH": "谨慎观察", "AVOID": "回避"}[recommendation],
+            "win_probability": score,
+            "expected_profit_pct": expected_profit_pct,
+            "expected_profit_range": f"{expected_profit_pct - 5:.1f}% ~ {expected_profit_pct + 7:.1f}%",
+            "confidence": 46 if reason else 58,
+            "action": action,
+            "key_reasons": evidence[:4] or ["基础发行资料有限，采用保守评分"],
+            "comment_insights": [
+                c.get("content") for c in (item.get("comments") or [])[:3]
+                if isinstance(c, dict) and c.get("content")
+            ],
+            "risk_flags": risk_flags[:4] or ["新股上市首日波动较大，盈利预期不构成收益承诺"],
+            "data_quality": reason or "规则回退分析，未调用或未成功调用 AI",
+        })
+
+    return {
+        "summary": "AI 暂不可用，已根据发行估值、申购热度和市场规则生成保守打新评分。",
+        "analyses": analyses,
+        "market_view": {
+            "regime": "规则回退",
+            "notes": ["数据不足时不编造评论或财务指标", "请结合券商额度、中签规则和个人风险承受能力决策"],
+        },
+        "data_quality": {"fallback": True, "reason": reason},
+    }
+
+
+def _normalize_ipo_analysis(raw: dict, items: list[dict]) -> dict:
+    raw = sanitize_ai_payload(raw if isinstance(raw, dict) else {})
+    by_id = {str(item.get("id")): item for item in items}
+    by_code = {str(item.get("code") or "").upper(): item for item in items}
+    raw_items = raw.get("analyses") or raw.get("ipo_analyses") or []
+    analyses = []
+    seen = set()
+
+    for row in raw_items:
+        if not isinstance(row, dict):
+            continue
+        item = by_id.get(str(row.get("ipo_id") or row.get("id") or ""))
+        if not item:
+            item = by_code.get(str(row.get("code") or "").upper())
+        if not item:
+            continue
+        win_probability = max(0, min(100, _normalize_ai_number(row.get("win_probability"), 50)))
+        expected_profit_pct = _normalize_ai_number(row.get("expected_profit_pct"), 0)
+        recommendation = str(row.get("recommendation") or "").upper()
+        if recommendation not in {"SUBSCRIBE", "WATCH", "AVOID"}:
+            recommendation = "SUBSCRIBE" if win_probability >= 68 else "WATCH" if win_probability >= 52 else "AVOID"
+        analyses.append({
+            "ipo_id": item.get("id"),
+            "code": item.get("code"),
+            "name": item.get("name"),
+            "market": item.get("market"),
+            "market_label": _ipo_market_label(str(item.get("market") or "")),
+            "recommendation": recommendation,
+            "recommendation_label": row.get("recommendation_label") or {"SUBSCRIBE": "建议申购", "WATCH": "谨慎观察", "AVOID": "回避"}[recommendation],
+            "win_probability": round(win_probability, 1),
+            "expected_profit_pct": round(expected_profit_pct, 2),
+            "expected_profit_range": row.get("expected_profit_range") or f"{expected_profit_pct - 5:.1f}% ~ {expected_profit_pct + 7:.1f}%",
+            "confidence": round(max(0, min(100, _normalize_ai_number(row.get("confidence"), 60))), 1),
+            "action": _clip_text(row.get("action") or row.get("conclusion") or "", 260),
+            "key_reasons": [
+                _clip_text(x, 180) for x in (row.get("key_reasons") or row.get("reasons") or [])[:5]
+                if str(x or "").strip()
+            ],
+            "comment_insights": [
+                _clip_text(x, 180) for x in (row.get("comment_insights") or row.get("user_comment_insights") or [])[:5]
+                if str(x or "").strip()
+            ],
+            "risk_flags": [
+                _clip_text(x, 180) for x in (row.get("risk_flags") or row.get("risks") or [])[:5]
+                if str(x or "").strip()
+            ],
+            "data_quality": _clip_text(row.get("data_quality") or "", 160),
+        })
+        seen.add(item.get("id"))
+
+    fallback = _fallback_ipo_analysis([item for item in items if item.get("id") not in seen])
+    analyses.extend(fallback["analyses"])
+    market_view = raw.get("market_view") if isinstance(raw.get("market_view"), dict) else {}
+    return {
+        "summary": _clip_text(raw.get("summary") or "新股打新分析完成", 300),
+        "analyses": analyses,
+        "market_view": market_view or fallback["market_view"],
+        "data_quality": raw.get("data_quality") if isinstance(raw.get("data_quality"), dict) else {"fallback_filled_count": len(fallback["analyses"])},
+    }
+
+
+def _run_ipo_ai_analysis(db: Session, items: list[dict], source_status: dict) -> dict:
+    api_key = get_setting(db, "openai_api_key")
+    base_url = normalize_openai_base_url(get_setting(db, "openai_base_url"))
+    model = get_setting(db, "openai_model") or "gpt-4o-mini"
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先在设置页面配置 OpenAI API Key")
+
+    personality = get_setting(db, "ai_personality") or "balanced"
+    report_style = get_setting(db, "ai_report_style") or "professional"
+    from agent.personality import build_system_prompt
+    system_prompt = build_system_prompt(personality, report_style)
+
+    compact_items = []
+    for item in items:
+        compact_items.append({
+            key: item.get(key)
+            for key in [
+                "id", "market", "code", "name", "company_name", "exchange", "sector",
+                "business", "apply_date", "listing_date", "issue_price", "price_range",
+                "currency", "issue_pe", "industry_pe", "issue_size", "fundraising_amount",
+                "online_apply_limit", "estimated_required_cash", "lot_size",
+                "subscription_multiple", "winning_rate", "sponsor", "status",
+                "source_label", "updated_at",
+            ]
+        } | {
+            "comments": [
+                c.get("content") for c in (item.get("comments") or [])[:5]
+                if isinstance(c, dict) and c.get("content")
+            ]
+        })
+
+    prompt = f"""{system_prompt}
+
+你是这个投资管理 APP 的“新股打新”分析师。请只基于下面的新股发行数据、数据源状态和评论/情绪摘要做分析。
+
+新股数据：
+{json.dumps(compact_items, ensure_ascii=False, default=str)}
+
+数据源状态：
+{json.dumps(source_status, ensure_ascii=False, default=str)}
+
+要求：
+1. 分别覆盖 A 股、港股、美股的新股打新逻辑；不要混淆各市场规则。
+2. 必须结合每个新股的数据和 comments/comment summary，说明是否值得打新。
+3. win_probability 表示“参与打新获得正收益/较好结果的主观胜率评分”，0-100。
+4. expected_profit_pct 表示上市初期或可交易后短期的期望收益率中位数，不是承诺收益。
+5. 数据缺失时直接写入 data_quality，不要编造招股书、评论或财务指标。
+6. 输出必须是 JSON，不要 Markdown。
+
+JSON 格式：
+{{
+  "summary": "总体结论，200字以内",
+  "market_view": {{
+    "regime": "当前新股市场环境判断",
+    "notes": ["跨市场打新观察1", "观察2"]
+  }},
+  "analyses": [
+    {{
+      "ipo_id": "必须对应输入 id",
+      "code": "代码",
+      "name": "名称",
+      "recommendation": "SUBSCRIBE/WATCH/AVOID",
+      "recommendation_label": "建议申购/谨慎观察/回避",
+      "win_probability": 0,
+      "expected_profit_pct": 0,
+      "expected_profit_range": "-5% ~ 8%",
+      "confidence": 0,
+      "action": "具体打新动作建议",
+      "key_reasons": ["数据依据1", "数据依据2"],
+      "comment_insights": ["评论/情绪要点"],
+      "risk_flags": ["主要风险"],
+      "data_quality": "数据完整度说明"
+    }}
+  ],
+  "data_quality": {{
+    "missing_fields": ["如有"],
+    "comment_coverage": "评论摘要覆盖说明"
+  }}
+}}"""
+
+    client = OpenAI(api_key=api_key, base_url=base_url or None, timeout=180)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        if not resp.choices:
+            raise ValueError("AI 返回了空响应")
+        raw = parse_ai_json_object(resp.choices[0].message.content or "")
+        return _normalize_ipo_analysis(raw, items)
+    except Exception as exc:
+        print(f"[IPOAnalysis] AI failed: {exc}")
+        return _fallback_ipo_analysis(items, str(exc))
+
+
+def _save_ipo_analysis_record(db: Session, markets: list[str], items: list[dict], result: dict) -> None:
+    try:
+        first_analysis = next((item for item in result.get("analyses", []) if isinstance(item, dict)), {})
+        record = IPOAnalysisRecord(
+            code=str(first_analysis.get("code") or ""),
+            name=str(first_analysis.get("name") or ""),
+            market=str(first_analysis.get("market") or (markets[0] if markets else "")),
+            analysis_json=json.dumps(result, ensure_ascii=False, default=str),
+            summary=str(result.get("summary") or ""),
+            win_rate=_normalize_ai_number(first_analysis.get("win_probability"), 0),
+            expected_profit=_normalize_ai_number(first_analysis.get("expected_profit_pct"), 0),
+            recommendation=str(first_analysis.get("recommendation") or ""),
+            markets=",".join(markets),
+            items_json=json.dumps(items, ensure_ascii=False, default=str),
+            result_json=json.dumps(result, ensure_ascii=False, default=str),
+            source_status_json=json.dumps(result.get("source_status", {}), ensure_ascii=False, default=str),
+        )
+        db.add(record)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        print(f"[IPOAnalysis] save record failed: {exc}")
+
+
+@app.get("/api/ipo/providers")
+def get_ipo_providers_info():
+    return {
+        "labels": IPO_PROVIDER_LABELS,
+        "options": IPO_PROVIDER_OPTIONS,
+        "defaults": DEFAULT_IPO_PROVIDERS,
+    }
+
+
+@app.post("/api/ipo/list", response_model=IPOListResponse)
+def list_ipos(req: IPOListRequest, db: Session = Depends(get_db)):
+    providers = _read_ipo_providers(db)
+    result = fetch_ipo_list(req.markets, providers, req.limit, req.force_refresh)
+    return IPOListResponse(**result)
+
+
+@app.post("/api/ipo/analyze", response_model=IPOAnalysisResponse)
+def analyze_ipos(req: IPOAnalysisRequest, db: Session = Depends(get_db)):
+    providers = _read_ipo_providers(db)
+    if req.items:
+        items = req.items
+        source_status = req.source_status or {}
+    else:
+        data = fetch_ipo_list(req.markets, providers, req.limit, req.force_refresh)
+        items = data.get("items", [])
+        source_status = data.get("source_status", {})
+
+    if req.ipo_ids:
+        selected = set(req.ipo_ids)
+        items = [item for item in items if str(item.get("id")) in selected]
+    if not items:
+        raise HTTPException(status_code=404, detail="暂无可分析的新股数据，请刷新数据源或调整市场范围")
+
+    result = _run_ipo_ai_analysis(db, items[: req.limit], source_status)
+    payload = {
+        **result,
+        "source_status": source_status,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_ipo_analysis_record(db, req.markets, items[: req.limit], payload)
+    return IPOAnalysisResponse(**payload)
+
+
+@app.get("/api/ipo/latest-analysis", response_model=IPOAnalysisResponse)
+def get_latest_ipo_analysis(db: Session = Depends(get_db)):
+    records = (
+        db.query(IPOAnalysisRecord)
+        .filter(
+            IPOAnalysisRecord.result_json.is_not(None),
+            IPOAnalysisRecord.result_json != "",
+            IPOAnalysisRecord.result_json != "{}",
+        )
+        .order_by(IPOAnalysisRecord.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    for record in records:
+        try:
+            result = json.loads(record.result_json or "{}")
+        except Exception:
+            continue
+        if not isinstance(result, dict) or not result.get("analyses"):
+            continue
+        if "generated_at" not in result:
+            result["generated_at"] = record.created_at.strftime("%Y-%m-%d %H:%M:%S") if record.created_at else ""
+        if "source_status" not in result:
+            result["source_status"] = json.loads(record.source_status_json or "{}")
+        return IPOAnalysisResponse(**result)
+    raise HTTPException(status_code=404, detail="暂无新股打新分析记录")
 
 
 @app.post("/api/market/lookup", response_model=MarketLookupResponse)
@@ -2292,6 +2726,9 @@ def download_backup(include_settings: bool = Query(True), db: Session = Depends(
 def clear_all_data(db: Session = Depends(get_db)):
     try:
         db.query(AnalysisRecord).delete()
+        db.query(InvestmentAdviceRecord).delete()
+        db.query(IPOAnalysisRecord).delete()
+        db.query(RecommendationSnapshot).delete()
         db.query(Asset).delete()
         db.query(Target).delete()
         db.query(Settings).delete()

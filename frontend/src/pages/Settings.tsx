@@ -7,9 +7,9 @@ import {
   ApiOutlined, ClockCircleOutlined, DownloadOutlined, UploadOutlined,
   KeyOutlined, SettingOutlined, SafetyOutlined, RobotOutlined, FileTextOutlined,
   DatabaseOutlined, StockOutlined, BankOutlined, ReloadOutlined, DeleteOutlined,
-  WarningOutlined, PlusOutlined, WalletOutlined
+  WarningOutlined, PlusOutlined, WalletOutlined, RocketOutlined
 } from '@ant-design/icons'
-import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, parallelApi, investmentAdviceApi, MarketProviders, InvestmentBudgetConfig, ParallelConfig } from '../api'
+import { settingsApi, backupApi, schedulerApi, marketApi, settingsApiFull, dataApi, parallelApi, investmentAdviceApi, ipoApi, InvestmentBudgetConfig, ParallelConfig } from '../api'
 
 const { Text, Paragraph } = Typography
 const goldStyle = { color: '#c9a84c' }
@@ -68,6 +68,18 @@ const CURRENCY_OPTIONS = [
   { value: 'USD', label: '美元' },
 ]
 
+const IPO_PROVIDER_FALLBACKS: Record<string, string> = {
+  A: 'eastmoney_a_ipo',
+  HK: 'aastocks_hk_ipo',
+  US: 'nasdaq_ipo',
+}
+
+const normalizeIpoProvider = (market: string, value?: string, defaults?: Record<string, string>) => {
+  const fallback = defaults?.[market] || IPO_PROVIDER_FALLBACKS[market] || ''
+  if (market === 'HK' && value === 'eastmoney_hk_ipo') return fallback
+  return value || fallback
+}
+
 const ASSET_TYPE_OPTIONS = [
   { value: 'stock', label: '股票' },
   { value: 'onshore_fund', label: '场内基金' },
@@ -103,13 +115,20 @@ export default function Settings() {
   const [intervalValue, setIntervalValue] = useState(1)
   const [dailyTime, setDailyTime] = useState('09:00')
   const [markets, setMarkets] = useState<string[]>([])
+  const [includePortfolio, setIncludePortfolio] = useState(true)
   const [includeTargets, setIncludeTargets] = useState(false)
+  const [includeInvestmentAdvice, setIncludeInvestmentAdvice] = useState(false)
+  const [includeIpo, setIncludeIpo] = useState(false)
+  const [ipoMarkets, setIpoMarkets] = useState<string[]>(['A', 'HK', 'US'])
 
   const [stockProviders, setStockProviders] = useState<Record<string, string>>({})
   const [fundProviders, setFundProviders] = useState<Record<string, string>>({})
   const [providerLabels, setProviderLabels] = useState<Record<string, string>>({})
   const [stockProviderOpts, setStockProviderOpts] = useState<Record<string, string[]>>({})
   const [fundProviderOpts, setFundProviderOpts] = useState<Record<string, string[]>>({})
+  const [ipoProviders, setIpoProviders] = useState<Record<string, string>>({})
+  const [ipoProviderLabels, setIpoProviderLabels] = useState<Record<string, string>>({})
+  const [ipoProviderOpts, setIpoProviderOpts] = useState<Record<string, string[]>>({})
   const [ocrUseSeparate, setOcrUseSeparate] = useState(false)
   const [aiModelOptions, setAiModelOptions] = useState<string[]>([])
   const [ocrModelOptions, setOcrModelOptions] = useState<string[]>([])
@@ -209,6 +228,7 @@ export default function Settings() {
     try {
       const [apiKey, baseUrl, model, pers, style, schedCfg,
         dsStockA, dsStockHK, dsStockUS, dsFundA, dsFundHK, dsFundUS, providersInfo,
+        dsIpoA, dsIpoHK, dsIpoUS, ipoProvidersInfo,
         ocrSame, ocrKey, ocrBase, ocrModel, budgetCfg] = await Promise.all([
         settingsApi.get('openai_api_key'),
         settingsApi.get('openai_base_url'),
@@ -223,6 +243,10 @@ export default function Settings() {
         settingsApi.get('datasource_fund_HK'),
         settingsApi.get('datasource_fund_US'),
         marketApi.providers(),
+        settingsApi.get('datasource_ipo_A'),
+        settingsApi.get('datasource_ipo_HK'),
+        settingsApi.get('datasource_ipo_US'),
+        ipoApi.providers(),
         settingsApi.get('ocr_use_same_as_ai'),
         settingsApi.get('ocr_api_key'),
         settingsApi.get('ocr_base_url'),
@@ -245,7 +269,11 @@ export default function Settings() {
       setIntervalValue(schedCfg.interval_value || 1)
       setDailyTime(schedCfg.daily_time || '09:00')
       setMarkets(schedCfg.markets || [])
+      setIncludePortfolio(schedCfg.include_portfolio !== false)
       setIncludeTargets(schedCfg.include_targets || false)
+      setIncludeInvestmentAdvice(Boolean(schedCfg.include_investment_advice))
+      setIncludeIpo(Boolean(schedCfg.include_ipo))
+      setIpoMarkets(schedCfg.ipo_markets?.length ? schedCfg.ipo_markets : ['A', 'HK', 'US'])
       setStockProviders({
         A: dsStockA.value || 'sina',
         HK: dsStockHK.value || 'sina',
@@ -259,6 +287,13 @@ export default function Settings() {
       setProviderLabels(providersInfo.labels)
       setStockProviderOpts(providersInfo.stock_options)
       setFundProviderOpts(providersInfo.fund_options)
+      setIpoProviders({
+        A: normalizeIpoProvider('A', dsIpoA.value, ipoProvidersInfo.defaults),
+        HK: normalizeIpoProvider('HK', dsIpoHK.value, ipoProvidersInfo.defaults),
+        US: normalizeIpoProvider('US', dsIpoUS.value, ipoProvidersInfo.defaults),
+      })
+      setIpoProviderLabels(ipoProvidersInfo.labels || {})
+      setIpoProviderOpts(ipoProvidersInfo.options || {})
       try {
         setBudgetConfigs(normalizeBudgetConfigs(JSON.parse(budgetCfg.value || '[]')))
         try {
@@ -690,6 +725,45 @@ export default function Settings() {
                             style={{ flex: 1 }}
                             options={(fundProviderOpts[market] || (market === 'A' ? ['tiantian', 'eastmoney', 'tencent', 'sina'] : ['eastmoney', 'yahoo'])).map(p => ({
                               value: p, label: providerLabels[p] || p,
+                            }))}
+                          />
+                        </div>
+                      )
+                    })}
+                  </Space>
+                </div>
+                <div style={{
+                  padding: '16px 20px', borderRadius: 12,
+                  background: 'rgba(26, 26, 36, 0.5)',
+                  border: '1px solid rgba(255,255,255,0.04)',
+                }}>
+                  <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>
+                      <RocketOutlined style={{ marginRight: 6, color: '#c9a84c' }} />
+                      新股打新数据源
+                    </Text>
+                    <Text style={{ color: '#5c5a55', fontSize: 12, marginBottom: 8 }}>
+                      单独配置 A 股、港股、美股的新股申购/IPO 数据来源，不与实时行情数据源混用
+                    </Text>
+                    {['A', 'HK', 'US'].map(market => {
+                      const marketLabel = { A: 'A 股', HK: '港股', US: '美股' }[market]
+                      return (
+                        <div key={`ipo-${market}`} style={{
+                          display: 'flex', alignItems: 'center', gap: 12, marginTop: 8,
+                          padding: '8px 12px', borderRadius: 8,
+                          background: 'rgba(255,255,255,0.02)',
+                        }}>
+                          <Text style={{ color: '#9a9892', minWidth: 50, fontSize: 13 }}>{marketLabel}</Text>
+                          <Select
+                            value={ipoProviders[market] || ipoProviderOpts[market]?.[0] || IPO_PROVIDER_FALLBACKS[market]}
+                            onChange={async (v) => {
+                              setIpoProviders(prev => ({ ...prev, [market]: v }))
+                              await settingsApi.update(`datasource_ipo_${market}`, v)
+                              message.success(`${marketLabel}新股数据源已更新`)
+                            }}
+                            style={{ flex: 1 }}
+                            options={(ipoProviderOpts[market] || [IPO_PROVIDER_FALLBACKS[market]]).map(p => ({
+                              value: p, label: ipoProviderLabels[p] || p,
                             }))}
                           />
                         </div>
@@ -1293,25 +1367,103 @@ export default function Settings() {
                 </div>
 
                 <div style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                   padding: '16px 20px', borderRadius: 12,
                   background: 'rgba(26, 26, 36, 0.5)',
                   border: '1px solid rgba(255,255,255,0.04)',
                 }}>
-                  <Space direction="vertical" size={2}>
-                    <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>AI 推荐标的</Text>
-                    <Text style={{ color: '#5c5a55', fontSize: 12 }}>
-                      定时分析时同时启动 AI 标的推荐
-                    </Text>
+                  <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                    <Space direction="vertical" size={2}>
+                      <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 14 }}>分析模块</Text>
+                      <Text style={{ color: '#5c5a55', fontSize: 12 }}>
+                        选择定时任务要生成的 AI 结果；AI 投资建议会更新「AI 投资建议」页面，新股打新会更新「新股打新」页面
+                      </Text>
+                    </Space>
+                    {[
+                      {
+                        key: 'portfolio',
+                        title: '组合 AI 分析',
+                        desc: '更新资产组合分析报告',
+                        checked: includePortfolio,
+                        onChange: async (checked: boolean) => {
+                          setIncludePortfolio(checked)
+                          await settingsApi.update('auto_analyze_include_portfolio', String(checked))
+                          message.success(checked ? '已开启定时组合分析' : '已关闭定时组合分析')
+                        },
+                      },
+                      {
+                        key: 'targets',
+                        title: 'AI 推荐标的',
+                        desc: '定时分析时同时启动 AI 标的推荐',
+                        checked: includeTargets,
+                        onChange: async (checked: boolean) => {
+                          setIncludeTargets(checked)
+                          await settingsApi.update('auto_analyze_include_targets', String(checked))
+                          message.success(checked ? '已开启定时推荐标的' : '已关闭定时推荐标的')
+                        },
+                      },
+                      {
+                        key: 'investmentAdvice',
+                        title: 'AI 投资建议',
+                        desc: '根据平台额度、持仓和标的池生成可执行买卖建议',
+                        checked: includeInvestmentAdvice,
+                        onChange: async (checked: boolean) => {
+                          setIncludeInvestmentAdvice(checked)
+                          await settingsApi.update('auto_analyze_include_investment_advice', String(checked))
+                          message.success(checked ? '已开启定时投资建议' : '已关闭定时投资建议')
+                        },
+                      },
+                      {
+                        key: 'ipo',
+                        title: '新股打新',
+                        desc: '拉取新股数据并生成打新胜率和盈利预期',
+                        checked: includeIpo,
+                        onChange: async (checked: boolean) => {
+                          setIncludeIpo(checked)
+                          await settingsApi.update('auto_analyze_include_ipo', String(checked))
+                          message.success(checked ? '已开启定时新股打新' : '已关闭定时新股打新')
+                        },
+                      },
+                    ].map(item => (
+                      <div key={item.key} style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        gap: 12, padding: '10px 12px', borderRadius: 8,
+                        background: 'rgba(255,255,255,0.02)',
+                      }}>
+                        <Space direction="vertical" size={0}>
+                          <Text style={{ color: '#e8e6e3', fontWeight: 500, fontSize: 13 }}>{item.title}</Text>
+                          <Text style={{ color: '#5c5a55', fontSize: 12 }}>{item.desc}</Text>
+                        </Space>
+                        <Switch checked={item.checked} onChange={item.onChange} />
+                      </div>
+                    ))}
+                    {includeIpo && (
+                      <div style={{
+                        padding: '10px 12px', borderRadius: 8,
+                        background: 'rgba(201, 168, 76, 0.05)',
+                        border: '1px solid rgba(201, 168, 76, 0.1)',
+                      }}>
+                        <Text style={{ color: '#c9a84c', fontSize: 12, display: 'block', marginBottom: 8 }}>
+                          新股打新市场
+                        </Text>
+                        <Select
+                          mode="multiple"
+                          value={ipoMarkets}
+                          onChange={async (v: string[]) => {
+                            if (v.length === 0) {
+                              message.warning('至少选择一个新股市场')
+                              return
+                            }
+                            setIpoMarkets(v)
+                            await settingsApi.update('auto_analyze_ipo_markets', v.join(','))
+                            message.success('新股打新市场已更新')
+                          }}
+                          style={{ width: '100%' }}
+                          options={MARKET_OPTIONS}
+                          maxTagCount={3}
+                        />
+                      </div>
+                    )}
                   </Space>
-                  <Switch
-                    checked={includeTargets}
-                    onChange={async (checked) => {
-                      setIncludeTargets(checked)
-                      await settingsApi.update('auto_analyze_include_targets', String(checked))
-                      message.success(checked ? '已开启定时推荐标的' : '已关闭定时推荐标的')
-                    }}
-                  />
                 </div>
               </Space>
             </Card>

@@ -219,6 +219,102 @@ export interface InvestmentAdviceResponse {
   asset_scope_label?: string
 }
 
+export type IPOMarket = 'A' | 'HK' | 'US'
+
+export interface IPOItem {
+  id: string
+  market: IPOMarket
+  code: string
+  apply_code: string
+  name: string
+  company_name: string
+  exchange: string
+  sector: string
+  business: string
+  apply_date: string
+  listing_date: string
+  pricing_date: string
+  issue_price: number | null
+  price_range: string
+  currency: 'CNY' | 'HKD' | 'USD' | string
+  issue_pe: number | null
+  industry_pe: number | null
+  issue_size: number | null
+  fundraising_amount: number | null
+  online_apply_limit: number | null
+  estimated_required_cash: number | null
+  lot_size: number | null
+  subscription_multiple: number | null
+  winning_rate: number | null
+  sponsor: string
+  raw_status: string
+  status: string
+  source: string
+  source_label: string
+  source_url: string
+  updated_at: string
+  comments: Array<{
+    source: string
+    author: string
+    content: string
+    sentiment: string
+  }>
+}
+
+export interface IPOSourceStatus {
+  provider: string
+  label: string
+  ok: boolean
+  count: number
+  note?: string
+  error?: string
+}
+
+export interface IPOListResponse {
+  items: IPOItem[]
+  source_status: Record<string, IPOSourceStatus>
+  providers: Record<string, string>
+  generated_at: string
+}
+
+export interface IPOAnalysisItem {
+  ipo_id: string
+  code: string
+  name: string
+  market: IPOMarket
+  market_label: string
+  recommendation: 'SUBSCRIBE' | 'WATCH' | 'AVOID'
+  recommendation_label: string
+  win_probability: number
+  expected_profit_pct: number
+  expected_profit_range: string
+  confidence: number
+  action: string
+  key_reasons: string[]
+  comment_insights: string[]
+  risk_flags: string[]
+  data_quality: string
+}
+
+export interface IPOAnalysisResponse {
+  summary: string
+  analyses: IPOAnalysisItem[]
+  market_view: {
+    regime?: string
+    notes?: string[]
+    [key: string]: any
+  }
+  data_quality: Record<string, any>
+  source_status: Record<string, IPOSourceStatus>
+  generated_at: string
+}
+
+export interface IPOProviders {
+  labels: Record<string, string>
+  options: Record<string, string[]>
+  defaults: Record<string, string>
+}
+
 export interface AIChatMessage {
   role: 'user' | 'assistant'
   content: string
@@ -297,6 +393,28 @@ export const investmentAdviceApi = {
     api.post<{message: string; reset_count: number}>('/investment-advice/reset-budget').then(r => r.data),
   budgetStatus: () =>
     api.get<any[]>('/investment-advice/budget-status').then(r => r.data),
+}
+
+export const ipoApi = {
+  list: (params: { markets?: IPOMarket[]; limit?: number; force_refresh?: boolean } = {}) =>
+    api.post<IPOListResponse>('/ipo/list', {
+      markets: params.markets || ['A', 'HK', 'US'],
+      limit: params.limit || 30,
+      force_refresh: Boolean(params.force_refresh),
+    }).then(r => r.data),
+  analyze: (params: { markets?: IPOMarket[]; ipo_ids?: string[]; items?: IPOItem[]; limit?: number; force_refresh?: boolean; source_status?: Record<string, IPOSourceStatus> } = {}) =>
+    api.post<IPOAnalysisResponse>('/ipo/analyze', {
+      markets: params.markets || ['A', 'HK', 'US'],
+      ipo_ids: params.ipo_ids || [],
+      items: params.items || [],
+      limit: params.limit || 30,
+      force_refresh: Boolean(params.force_refresh),
+      source_status: params.source_status || {},
+    }).then(r => r.data),
+  latestAnalysis: () =>
+    api.get<IPOAnalysisResponse>('/ipo/latest-analysis').then(r => r.data),
+  providers: () =>
+    api.get<IPOProviders>('/ipo/providers').then(r => r.data),
 }
 
 export const chatApi = {

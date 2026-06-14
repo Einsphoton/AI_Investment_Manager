@@ -9,6 +9,7 @@ import AIChat from './pages/AIChat'
 import SkillMarket from './pages/SkillMarket'
 import Settings from './pages/Settings'
 import Ocr from './pages/Ocr'
+import IPO from './pages/IPO'
 import ErrorBoundary from './components/ErrorBoundary'
 
 export default function App() {
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/assets" element={<ErrorBoundary><Assets /></ErrorBoundary>} />
           <Route path="/targets" element={<ErrorBoundary><Targets /></ErrorBoundary>} />
           <Route path="/investment-advice" element={<ErrorBoundary><InvestmentAdvice /></ErrorBoundary>} />
+          <Route path="/ipo" element={<ErrorBoundary><IPO /></ErrorBoundary>} />
           <Route path="/chat" element={<ErrorBoundary><AIChat /></ErrorBoundary>} />
           <Route path="/skills" element={<ErrorBoundary><SkillMarket /></ErrorBoundary>} />
           <Route path="/settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />

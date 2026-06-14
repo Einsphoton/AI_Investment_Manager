@@ -8,6 +8,7 @@ import {
   ScanOutlined,
   BulbOutlined,
   MessageOutlined,
+  RocketOutlined,
 } from '@ant-design/icons'
 import { Outlet, useNavigate, useLocation } from 'react-router-dom'
 import AIProgressOverlay from './AIProgressOverlay'
@@ -39,6 +40,11 @@ const menuItems = [
     key: '/investment-advice',
     icon: <BulbOutlined />,
     label: 'AI 投资建议',
+  },
+  {
+    key: '/ipo',
+    icon: <RocketOutlined />,
+    label: '新股打新',
   },
   {
     key: '/chat',

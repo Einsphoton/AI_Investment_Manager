@@ -97,6 +97,7 @@ class InvestmentAdviceRecord(Base):
     id = Column(Integer, primary_key=True, index=True)
     summary = Column(Text, default="")
     advice_json = Column(Text, default="[]")
+    ipo_advice_json = Column(Text, default="[]")
     budget_status_json = Column(Text, default="[]")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -117,6 +118,28 @@ class IPOAnalysisRecord(Base):
     items_json = Column(Text, default="[]")
     result_json = Column(Text, default="{}")
     source_status_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class IPOTradeRecord(Base):
+    __tablename__ = "ipo_trade_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ipo_id = Column(String(100), default="", index=True)
+    code = Column(String(30), nullable=False, index=True)
+    name = Column(String(100), default="")
+    market = Column(String(10), nullable=False, index=True)
+    platform = Column(String(50), default="", index=True)
+    currency = Column(String(10), default="CNY")
+    trade_type = Column(String(20), nullable=False)  # SUBSCRIBE, SELL
+    shares = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    fee = Column(Float, default=0.0)
+    trade_date = Column(String(20), nullable=False)
+    realized_pnl = Column(Float, default=0.0)
+    analysis_snapshot_json = Column(Text, default="{}")
+    advice_snapshot_json = Column(Text, default="{}")
+    note = Column(Text, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

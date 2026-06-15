@@ -365,6 +365,7 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
         _candidate_investment_targets, _read_providers,
         _latest_today_asset_analysis, _build_investment_advice_prompt,
         _normalize_asset_scope, _asset_scope_label, _filter_assets_by_scope,
+        _compact_ipo_advice_context,
     )
     asset_scope = _normalize_asset_scope(asset_scope, "all")
     budgets = _load_investment_budgets(db)
@@ -387,8 +388,11 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
 
     asset_items, target_items = _candidate_investment_targets(db, budgets, assets, providers)
     today_analysis = _latest_today_asset_analysis(db, assets)
+    ipo_context = _compact_ipo_advice_context(db, budget_status)
 
     yield sse_event("log", {"message": f"候选持仓: {len(asset_items)}, 候选标的: {len(target_items)}", "tag": "配置"})
+    if ipo_context:
+        yield sse_event("log", {"message": f"已纳入 {len(ipo_context)} 条新股打新分析", "tag": "新股"})
     yield sse_event("progress", {"progress": 18})
 
     yield sse_event("thinking", {"message": "AI 正在分析投资策略..."})
@@ -403,7 +407,8 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
         asset_items,
         target_items,
         today_analysis,
-        asset_scope,
+        ipo_context=ipo_context,
+        asset_scope=asset_scope,
     )
     yield sse_event("progress", {"progress": 30})
 
@@ -452,11 +457,13 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
         result = _normalize_investment_advice(
             raw, budgets, assets, target_items, budget_status, market_snapshot,
             diagnostics=diagnostics,
+            ipo_context=ipo_context,
             asset_scope=asset_scope,
         )
 
         final_advice = result.get('advice', []) or []
-        if not final_advice and diagnostics:
+        final_ipo_advice = result.get("ipo_advice", []) or []
+        if not final_advice and not final_ipo_advice and diagnostics:
             from collections import Counter
             category_counts = Counter(d["category"] for d in diagnostics)
             reason_counts = Counter(d["reason"] for d in diagnostics)
@@ -491,6 +498,7 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
         record = InvestmentAdviceRecord(
             summary=result.get('summary', ''),
             advice_json=json.dumps(result.get('advice', []), ensure_ascii=False, default=str),
+            ipo_advice_json=json.dumps(result.get('ipo_advice', []), ensure_ascii=False, default=str),
             budget_status_json=json.dumps(result.get('budget_status', []), ensure_ascii=False, default=str),
         )
         db.add(record)
@@ -500,10 +508,14 @@ def stream_investment_advice(db: Session, asset_scope: str = "all") -> Generator
             "message": (
                 f"✅ 共生成 {len(result.get('advice', []))} 条交易建议"
                 if result.get('advice') else
+                "✅ 投资建议已生成，本次重点为新股申购建议"
+                if result.get("ipo_advice") else
                 "⚠️ 投资建议已生成 0 条，请查看上方过滤原因或检查 AI 输出"
             ),
             "tag": "AI",
         })
+        if result.get("ipo_advice"):
+            yield sse_event("log", {"message": f"✅ 已生成 {len(result.get('ipo_advice', []))} 条新股申购建议", "tag": "新股"})
         yield sse_event("progress", {"progress": 100})
         yield sse_event("complete", result)
 

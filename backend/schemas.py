@@ -211,12 +211,77 @@ class InvestmentAdviceAcceptRequest(BaseModel):
 class InvestmentAdviceResponse(BaseModel):
     summary: str
     advice: list[dict] = []
+    ipo_advice: list[dict] = []
     budget_status: list[dict] = []
     market_context: dict = {}
     market_snapshot: dict = {}
     decision_audit: list[dict] = []
     asset_scope: str = "all"
     asset_scope_label: str = "全部资产"
+
+
+class IPOTradeCreate(BaseModel):
+    ipo_id: str = ""
+    code: str
+    name: str = ""
+    market: str
+    platform: str = ""
+    currency: str = "CNY"
+    trade_type: str
+    shares: float = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    fee: float = 0.0
+    trade_date: str = ""
+    analysis_snapshot: dict = {}
+    advice_snapshot: dict = {}
+    note: str = ""
+
+    @field_validator("market", mode="before")
+    @classmethod
+    def normalize_market(cls, value):
+        return str(value or "").strip().upper()
+
+    @field_validator("trade_type", mode="before")
+    @classmethod
+    def normalize_trade_type(cls, value):
+        raw = str(value or "").strip().upper()
+        if raw in {"BUY", "APPLY", "申购"}:
+            return "SUBSCRIBE"
+        if raw in {"SELL", "卖出"}:
+            return "SELL"
+        return raw
+
+
+class IPOTradeResponse(BaseModel):
+    id: int
+    ipo_id: str
+    code: str
+    name: str
+    market: str
+    platform: str
+    currency: str
+    trade_type: str
+    shares: float
+    price: float
+    fee: float
+    trade_date: str
+    realized_pnl: float
+    analysis_snapshot: dict = {}
+    advice_snapshot: dict = {}
+    note: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class IPORealizedPnlResponse(BaseModel):
+    realized_pnl: float = 0.0
+    total_sell_amount: float = 0.0
+    total_cost_basis: float = 0.0
+    total_fee: float = 0.0
+    closed_trades: int = 0
+    open_positions: list[dict] = []
 
 
 class IPOListRequest(BaseModel):

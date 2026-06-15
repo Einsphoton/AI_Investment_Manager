@@ -24,7 +24,7 @@ from openai import OpenAI
 from database import get_db, init_db, SessionLocal
 from models import (
     Asset, AssetTransaction, AnalysisRecord, Settings, Target, InstalledSkill,
-    InvestmentAdviceRecord, IPOAnalysisRecord, RecommendationSnapshot,
+    InvestmentAdviceRecord, IPOAnalysisRecord, IPOTradeRecord, RecommendationSnapshot,
 )
 from schemas import (
     AssetCreate, AssetUpdate, AssetResponse,
@@ -36,6 +36,7 @@ from schemas import (
     AIChatRequest, AIChatResponse, AIChatContextResponse,
     InvestmentAdviceAcceptRequest, InvestmentAdviceResponse,
     IPOAnalysisRequest, IPOAnalysisResponse, IPOListRequest, IPOListResponse,
+    IPOTradeCreate, IPOTradeResponse, IPORealizedPnlResponse,
     MarketLookupRequest, MarketLookupResponse,
     MarketQuoteRequest, MarketQuoteResponse,
     MarketSearchRequest, MarketSearchResponse, MarketSearchItem,
@@ -214,16 +215,16 @@ def scheduled_analysis():
                 _run_scheduled_target_analysis(db)
             except Exception as exc:
                 print(f"[ScheduledAnalysis] targets failed: {exc}")
-        if cfg.get("include_investment_advice"):
-            try:
-                _run_scheduled_investment_advice(db)
-            except Exception as exc:
-                print(f"[ScheduledAnalysis] investment advice failed: {exc}")
         if cfg.get("include_ipo"):
             try:
                 _run_scheduled_ipo_analysis(db, cfg.get("ipo_markets") or cfg.get("markets") or ["A", "HK", "US"])
             except Exception as exc:
                 print(f"[ScheduledAnalysis] IPO failed: {exc}")
+        if cfg.get("include_investment_advice"):
+            try:
+                _run_scheduled_investment_advice(db)
+            except Exception as exc:
+                print(f"[ScheduledAnalysis] investment advice failed: {exc}")
     finally:
         db.close()
 
@@ -648,6 +649,7 @@ def get_dashboard(db: Session = Depends(get_db)):
 
     latest_analysis = _latest_successful_analysis(db)
     realized = latest_analysis.realized_pnl if latest_analysis else 0
+    realized += _ipo_realized_pnl(db).get("realized_pnl", 0)
 
     return DashboardData(
         total_market_value=round(total_market_value, 2),
@@ -1104,6 +1106,199 @@ def _currency_label(currency: str) -> str:
     return {"CNY": "人民币", "HKD": "港元", "USD": "美元"}.get(currency, currency)
 
 
+def _normalize_ipo_trade_type(value: str | None) -> str:
+    raw = str(value or "").strip().upper()
+    if raw in {"SUBSCRIBE", "BUY", "APPLY", "申购"}:
+        return "SUBSCRIBE"
+    if raw in {"SELL", "卖出"}:
+        return "SELL"
+    return raw
+
+
+def _serialize_ipo_trade(record: IPOTradeRecord) -> dict:
+    return {
+        "id": record.id,
+        "ipo_id": record.ipo_id or "",
+        "code": record.code or "",
+        "name": record.name or "",
+        "market": record.market or "",
+        "platform": record.platform or "",
+        "currency": record.currency or _market_currency(record.market or "A"),
+        "trade_type": _normalize_ipo_trade_type(record.trade_type),
+        "shares": float(record.shares or 0),
+        "price": float(record.price or 0),
+        "fee": float(record.fee or 0),
+        "trade_date": record.trade_date or "",
+        "realized_pnl": round(float(record.realized_pnl or 0), 2),
+        "analysis_snapshot": _safe_json_loads(record.analysis_snapshot_json, {}),
+        "advice_snapshot": _safe_json_loads(record.advice_snapshot_json, {}),
+        "note": record.note or "",
+        "created_at": record.created_at,
+    }
+
+
+def _ipo_trade_sort_key(record: IPOTradeRecord) -> tuple:
+    return (
+        record.trade_date or "",
+        record.created_at or datetime.min,
+        record.id or 0,
+    )
+
+
+def _query_ipo_trades_for_symbol(
+    db: Session,
+    market: str,
+    code: str,
+    platform: str | None = None,
+) -> list[IPOTradeRecord]:
+    q = db.query(IPOTradeRecord).filter(
+        IPOTradeRecord.market == str(market or "").strip().upper(),
+        IPOTradeRecord.code == str(code or "").strip().upper(),
+    )
+    if platform:
+        q = q.filter(IPOTradeRecord.platform == platform)
+    return sorted(q.all(), key=_ipo_trade_sort_key)
+
+
+def _consume_ipo_lots(lots: list[dict], shares: float) -> tuple[float, float]:
+    remaining = float(shares or 0)
+    consumed = 0.0
+    cost_basis = 0.0
+    while remaining > 1e-9 and lots:
+        lot = lots[0]
+        qty = min(remaining, lot["shares"])
+        cost_basis += qty * lot["unit_cost"]
+        lot["shares"] -= qty
+        remaining -= qty
+        consumed += qty
+        if lot["shares"] <= 1e-9:
+            lots.pop(0)
+    return consumed, cost_basis
+
+
+def _ipo_open_lots(
+    db: Session,
+    market: str,
+    code: str,
+    platform: str | None = None,
+) -> list[dict]:
+    lots: list[dict] = []
+    for trade in _query_ipo_trades_for_symbol(db, market, code, platform if platform else None):
+        trade_type = _normalize_ipo_trade_type(trade.trade_type)
+        shares = float(trade.shares or 0)
+        price = float(trade.price or 0)
+        fee = float(trade.fee or 0)
+        if shares <= 0 or price <= 0:
+            continue
+        if trade_type == "SUBSCRIBE":
+            lots.append({
+                "shares": shares,
+                "unit_cost": price + (fee / shares if shares > 0 else 0),
+                "price": price,
+                "trade_date": trade.trade_date or "",
+                "platform": trade.platform or "",
+                "currency": trade.currency or _market_currency(trade.market or "A"),
+            })
+        elif trade_type == "SELL":
+            _consume_ipo_lots(lots, shares)
+    return lots
+
+
+def _ipo_sale_preview(
+    db: Session,
+    market: str,
+    code: str,
+    platform: str | None,
+    shares: float,
+    sell_price: float,
+    fee: float = 0.0,
+) -> dict:
+    lots = _ipo_open_lots(db, market, code, platform if platform else None)
+    available = sum(lot["shares"] for lot in lots)
+    if shares > available + 1e-6:
+        raise HTTPException(
+            status_code=400,
+            detail=f"该新股可卖出申购份额不足：当前剩余 {available:.4f}，本次卖出 {shares:.4f}",
+        )
+    consumed, cost_basis = _consume_ipo_lots(lots, shares)
+    sell_amount = consumed * sell_price
+    realized_pnl = sell_amount - cost_basis - float(fee or 0)
+    return {
+        "available_shares": round(available, 4),
+        "sold_shares": round(consumed, 4),
+        "cost_basis": round(cost_basis, 4),
+        "sell_amount": round(sell_amount, 4),
+        "realized_pnl": round(realized_pnl, 4),
+        "avg_cost": round(cost_basis / consumed, 4) if consumed > 0 else 0,
+    }
+
+
+def _ipo_realized_pnl(db: Session) -> dict:
+    trades = sorted(db.query(IPOTradeRecord).all(), key=_ipo_trade_sort_key)
+    lots_by_key: dict[tuple[str, str, str, str], list[dict]] = {}
+    realized = 0.0
+    total_sell_amount = 0.0
+    total_cost_basis = 0.0
+    total_fee = 0.0
+    closed_trades = 0
+
+    for trade in trades:
+        market = str(trade.market or "").strip().upper()
+        code = str(trade.code or "").strip().upper()
+        platform = str(trade.platform or "").strip()
+        currency = str(trade.currency or _market_currency(market)).strip().upper()
+        key = (market, code, platform, currency)
+        lots = lots_by_key.setdefault(key, [])
+        trade_type = _normalize_ipo_trade_type(trade.trade_type)
+        shares = float(trade.shares or 0)
+        price = float(trade.price or 0)
+        fee = float(trade.fee or 0)
+        if shares <= 0 or price <= 0:
+            continue
+        if trade_type == "SUBSCRIBE":
+            lots.append({
+                "shares": shares,
+                "unit_cost": price + (fee / shares if shares > 0 else 0),
+                "price": price,
+                "trade_date": trade.trade_date or "",
+            })
+        elif trade_type == "SELL":
+            consumed, cost_basis = _consume_ipo_lots(lots, shares)
+            if consumed <= 0:
+                continue
+            sell_amount = consumed * price
+            realized += sell_amount - cost_basis - fee
+            total_sell_amount += sell_amount
+            total_cost_basis += cost_basis
+            total_fee += fee
+            closed_trades += 1
+
+    open_positions = []
+    for (market, code, platform, currency), lots in lots_by_key.items():
+        open_shares = sum(lot["shares"] for lot in lots)
+        if open_shares <= 1e-9:
+            continue
+        cost_basis = sum(lot["shares"] * lot["unit_cost"] for lot in lots)
+        open_positions.append({
+            "market": market,
+            "code": code,
+            "platform": platform,
+            "currency": currency,
+            "shares": round(open_shares, 4),
+            "cost_basis": round(cost_basis, 2),
+            "avg_cost": round(cost_basis / open_shares, 4) if open_shares > 0 else 0,
+        })
+
+    return {
+        "realized_pnl": round(realized, 2),
+        "total_sell_amount": round(total_sell_amount, 2),
+        "total_cost_basis": round(total_cost_basis, 2),
+        "total_fee": round(total_fee, 2),
+        "closed_trades": closed_trades,
+        "open_positions": open_positions,
+    }
+
+
 def _asset_source(asset: Asset | None) -> str:
     source = str(getattr(asset, "source", "") or "manual").strip()
     return "ai_advice" if source == "ai_advice" else "manual"
@@ -1355,14 +1550,17 @@ def _build_investment_advice_prompt(
     asset_items: list[dict],
     target_items: list[dict],
     today_analysis: dict,
+    ipo_context: list[dict] | None = None,
     asset_scope: str = "all",
 ) -> tuple[str, dict]:
     asset_scope = _normalize_asset_scope(asset_scope, "all")
+    ipo_context = ipo_context or []
     market_snapshot = _investment_market_snapshot(asset_items, target_items, budget_status)
     market_snapshot["asset_scope"] = {
         "value": asset_scope,
         "label": _asset_scope_label(asset_scope),
     }
+    market_snapshot["ipo_advice_candidates"] = len(ipo_context)
     candidate_digest = _compact_investment_candidates(asset_items, target_items, today_analysis)
 
     prompt = f"""{system_prompt}
@@ -1392,11 +1590,15 @@ def _build_investment_advice_prompt(
 ## 今天的资产 AI 分析结果
 {json.dumps(today_analysis, ensure_ascii=False, default=str)[:12000]}
 
+## 最新新股打新 AI 分析
+{json.dumps(ipo_context, ensure_ascii=False, default=str)[:12000]}
+
 ## 强制决策流程
 1. 先判断市场环境：逐个市场说明样本涨跌、平均涨跌幅、数据覆盖是否足够。
 2. 再逐项审视持仓：必须结合持仓盈亏、当日涨跌、已有资产分析判断是否需要卖出或继续持有。
 3. 再逐项审视候选标的：必须结合入选理由、前期 AI 分析、当前价格/涨跌和额度约束判断是否值得买入。
-4. 最后只输出通过审视的交易建议；如果证据不足，advice 必须返回空数组，并在 summary 说明原因。
+4. 再审视“最新新股打新 AI 分析”：对每只新股给出是否申购；如果建议申购，必须同时给出上市后或暗盘的卖出时机、止盈和止损条件。
+5. 最后只输出通过审视的交易建议；如果普通股票/基金证据不足，advice 可以返回空数组，并在 summary 说明原因；新股建议放入 ipo_advice，不要混入 advice。
 
 ## 硬性约束
 1. 买入建议只能来自当前持仓或标的池，卖出建议只能来自当前持仓。
@@ -1406,6 +1608,7 @@ def _build_investment_advice_prompt(
 5. shares 必须是数字；price 使用最新行情价；trade_type 只能是 BUY 或 SELL。
 6. 每条 advice 的 reason 必须引用至少两个具体数据点，例如当前价、当日涨跌幅、持仓盈亏、额度占用、PE/PB、前期分析结论等。
 7. 每条 advice 必须提供 evidence 数组，逐条列出支撑该交易的事实；没有 evidence 的建议会被系统丢弃。
+8. ipo_advice 只能来自“最新新股打新 AI 分析”，decision 只能是 SUBSCRIBE/WATCH/AVOID；SUBSCRIBE 必须提供 sell_timing、take_profit、stop_loss。
 
 请只返回 JSON：
 {{
@@ -1438,6 +1641,25 @@ def _build_investment_advice_prompt(
       "confidence_score": 0,
       "risk_note": "主要风险"
     }}
+  ],
+  "ipo_advice": [
+    {{
+      "ipo_id": "新股 id",
+      "market": "A/HK/US",
+      "code": "新股代码",
+      "name": "新股名称",
+      "decision": "SUBSCRIBE/WATCH/AVOID",
+      "decision_label": "建议申购/谨慎观察/回避申购",
+      "suggested_shares": 0,
+      "suggested_price": 0,
+      "reason": "是否申购的理由，必须引用胜率、预期收益、发行数据或评论情绪",
+      "sell_timing": "建议卖出时机，例如暗盘/上市首日/触发条件",
+      "take_profit": "止盈条件",
+      "stop_loss": "止损条件",
+      "evidence": ["胜率xx%", "预期收益xx%", "评论或估值证据"],
+      "confidence_score": 0,
+      "risk_note": "主要风险"
+    }}
   ]
 }}
 
@@ -1467,6 +1689,291 @@ def _advice_passes_evidence_gate(item: dict, existing_asset: Asset | None, candi
     if market_snapshot.get("data_quality", {}).get("quote_items", 0) == 0:
         return False, "本次运行缺少有效行情数据"
     return True, ""
+
+
+def _ipo_price_from_range(value) -> float:
+    text = str(value or "")
+    nums = [
+        _normalize_ai_number(match, 0)
+        for match in re.findall(r"\d+(?:\.\d+)?", text)
+    ]
+    nums = [num for num in nums if num > 0]
+    if len(nums) >= 2:
+        return sum(nums[:2]) / 2
+    return nums[0] if nums else 0
+
+
+def _ipo_issue_price(item: dict, analysis: dict | None = None) -> float:
+    analysis = analysis or {}
+    for source in (item, analysis):
+        price = _normalize_ai_number(source.get("issue_price") or source.get("suggested_price"), 0)
+        if price > 0:
+            return price
+    return _ipo_price_from_range(item.get("price_range") or analysis.get("price_range"))
+
+
+def _ipo_default_lot_size(market: str, item: dict) -> float:
+    lot_size = _normalize_ai_number(item.get("lot_size"), 0)
+    if lot_size > 0:
+        return lot_size
+    return 500 if market == "A" else 100 if market == "HK" else 1
+
+
+def _ipo_default_platform(budget_status: list[dict] | None, market: str) -> str:
+    for budget in budget_status or []:
+        if (
+            market in (budget.get("markets") or [])
+            and "stock" in (budget.get("asset_types") or [])
+            and budget.get("currency") == _market_currency(market)
+        ):
+            return str(budget.get("platform") or "").strip()
+    return ""
+
+
+def _ipo_sell_plan(decision: str, expected_profit_pct: float, listing_date: str, market: str) -> dict:
+    listing_text = f"{listing_date} 上市后" if listing_date else "上市后"
+    if decision == "SUBSCRIBE":
+        upper = max(expected_profit_pct + 5, expected_profit_pct * 1.35)
+        if market == "HK":
+            timing = f"暗盘或{listing_text}首日观察流动性，若涨幅接近 {upper:.1f}% 可分批止盈。"
+        elif market == "US":
+            timing = f"{listing_text}首个交易日优先看开盘成交和承销稳定表现，冲高接近 {upper:.1f}% 可先兑现。"
+        else:
+            timing = f"{listing_text}首日若涨幅接近预期收益区间上沿，可分批止盈；若明显弱于板块则缩短持有。"
+        return {
+            "sell_timing": timing,
+            "take_profit": f"涨幅接近或超过 {upper:.1f}% 时分批止盈，强势放量可保留小部分观察。",
+            "stop_loss": "跌破发行价、暗盘转弱或上市首日换手承接不足时，首日或次日止损。",
+        }
+    if decision == "WATCH":
+        return {
+            "sell_timing": "暂不建议直接申购；若后续定价、申购热度或市场情绪改善，再重新生成卖出计划。",
+            "take_profit": "等待申购结论转为建议申购后再设置止盈。",
+            "stop_loss": "若估值或情绪继续走弱，维持不参与。",
+        }
+    return {
+        "sell_timing": "不建议申购，因此不生成卖出计划。",
+        "take_profit": "不适用。",
+        "stop_loss": "回避申购，避免上市初期波动风险。",
+    }
+
+
+def _latest_ipo_analysis_context(db: Session) -> dict:
+    records = (
+        db.query(IPOAnalysisRecord)
+        .filter(
+            IPOAnalysisRecord.result_json.is_not(None),
+            IPOAnalysisRecord.result_json != "",
+            IPOAnalysisRecord.result_json != "{}",
+        )
+        .order_by(IPOAnalysisRecord.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    for record in records:
+        result = _safe_json_loads(record.result_json, {})
+        if not isinstance(result, dict) or not isinstance(result.get("analyses"), list) or not result.get("analyses"):
+            continue
+        items = _safe_json_loads(record.items_json, [])
+        if not isinstance(items, list):
+            items = []
+        return {
+            "summary": result.get("summary") or record.summary or "",
+            "analyses": result.get("analyses") or [],
+            "market_view": result.get("market_view") if isinstance(result.get("market_view"), dict) else {},
+            "items": items,
+            "source_status": result.get("source_status") or _safe_json_loads(record.source_status_json, {}),
+            "generated_at": result.get("generated_at") or (record.created_at.strftime("%Y-%m-%d %H:%M:%S") if record.created_at else ""),
+        }
+    return {}
+
+
+def _compact_ipo_advice_context(db: Session, budget_status: list[dict] | None = None, limit: int = 12) -> list[dict]:
+    latest = _latest_ipo_analysis_context(db)
+    if not latest:
+        return []
+
+    items = latest.get("items") or []
+    by_id = {str(item.get("id") or ""): item for item in items if isinstance(item, dict)}
+    by_code = {str(item.get("code") or "").upper(): item for item in items if isinstance(item, dict)}
+    result: list[dict] = []
+
+    for idx, analysis in enumerate(latest.get("analyses") or []):
+        if not isinstance(analysis, dict):
+            continue
+        item = by_id.get(str(analysis.get("ipo_id") or "")) or by_code.get(str(analysis.get("code") or "").upper()) or {}
+        market = str(analysis.get("market") or item.get("market") or "").strip().upper()
+        if market not in {"A", "HK", "US"}:
+            continue
+        code = str(analysis.get("code") or item.get("code") or "").strip().upper()
+        if not code:
+            continue
+        win_probability = max(0, min(100, _normalize_ai_number(analysis.get("win_probability"), 50)))
+        expected_profit_pct = _normalize_ai_number(analysis.get("expected_profit_pct"), 0)
+        decision = str(analysis.get("recommendation") or "").strip().upper()
+        if decision not in {"SUBSCRIBE", "WATCH", "AVOID"}:
+            decision = "SUBSCRIBE" if win_probability >= 68 else "WATCH" if win_probability >= 52 else "AVOID"
+
+        price = _ipo_issue_price(item, analysis)
+        lot_size = _ipo_default_lot_size(market, item)
+        suggested_shares = lot_size if decision == "SUBSCRIBE" else 0
+        estimated_amount = price * suggested_shares if price > 0 and suggested_shares > 0 else 0
+        currency = str(item.get("currency") or _market_currency(market)).strip().upper()
+        listing_date = str(item.get("listing_date") or "")
+        plan = _ipo_sell_plan(decision, expected_profit_pct, listing_date, market)
+        key_reasons = [
+            _clip_text(v, 180)
+            for v in (analysis.get("key_reasons") or [])[:4]
+            if str(v or "").strip()
+        ]
+        comment_insights = [
+            _clip_text(v, 180)
+            for v in (analysis.get("comment_insights") or [])[:3]
+            if str(v or "").strip()
+        ]
+        risk_flags = [
+            _clip_text(v, 180)
+            for v in (analysis.get("risk_flags") or [])[:4]
+            if str(v or "").strip()
+        ]
+        evidence = [
+            f"打新胜率评分 {win_probability:.1f}%",
+            f"预期收益 {expected_profit_pct:.2f}%，区间 {analysis.get('expected_profit_range') or '-'}",
+            *key_reasons[:3],
+        ]
+        if item.get("subscription_multiple"):
+            evidence.append(f"申购热度 {item.get('subscription_multiple')} 倍")
+        if item.get("issue_pe") and item.get("industry_pe"):
+            evidence.append(f"发行 PE {item.get('issue_pe')}，行业参考 PE {item.get('industry_pe')}")
+
+        result.append({
+            "id": f"ipo-advice-{idx + 1}-{code}",
+            "ipo_id": str(analysis.get("ipo_id") or item.get("id") or code),
+            "market": market,
+            "market_label": _ipo_market_label(market),
+            "code": code,
+            "name": str(analysis.get("name") or item.get("name") or code),
+            "decision": decision,
+            "decision_label": {"SUBSCRIBE": "建议申购", "WATCH": "谨慎观察", "AVOID": "回避申购"}[decision],
+            "suggested_shares": round(suggested_shares, 4),
+            "suggested_price": round(price, 4),
+            "estimated_amount": round(estimated_amount, 2),
+            "currency": currency,
+            "currency_label": _currency_label(currency),
+            "platform": _ipo_default_platform(budget_status, market),
+            "win_probability": round(win_probability, 1),
+            "expected_profit_pct": round(expected_profit_pct, 2),
+            "expected_profit_range": str(analysis.get("expected_profit_range") or ""),
+            "confidence_score": round(max(0, min(100, _normalize_ai_number(analysis.get("confidence"), 60))), 1),
+            "reason": _clip_text(analysis.get("action") or "基于最新新股打新分析生成申购建议", 320),
+            "sell_timing": plan["sell_timing"],
+            "take_profit": plan["take_profit"],
+            "stop_loss": plan["stop_loss"],
+            "evidence": [_clip_text(v, 180) for v in evidence if str(v or "").strip()][:6],
+            "risk_note": "；".join(risk_flags[:3]) or "新股上市初期波动较大，胜率和收益预期不构成收益承诺。",
+            "key_reasons": key_reasons,
+            "comment_insights": comment_insights,
+            "risk_flags": risk_flags,
+            "apply_date": str(item.get("apply_date") or ""),
+            "listing_date": listing_date,
+            "issue_price": round(price, 4) if price > 0 else None,
+            "price_range": str(item.get("price_range") or ""),
+            "lot_size": round(lot_size, 4),
+            "source_label": str(item.get("source_label") or ""),
+            "source_url": str(item.get("source_url") or ""),
+            "analysis_snapshot": analysis,
+            "generated_at": latest.get("generated_at") or "",
+        })
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+def _normalize_ipo_advice_decision(value: str | None, fallback: str) -> str:
+    raw = str(value or fallback or "").strip().upper()
+    if raw in {"SUBSCRIBE", "BUY", "APPLY", "建议申购", "申购"}:
+        return "SUBSCRIBE"
+    if raw in {"WATCH", "HOLD", "WAIT", "观察", "谨慎观察"}:
+        return "WATCH"
+    if raw in {"AVOID", "SKIP", "回避", "不申购", "回避申购"}:
+        return "AVOID"
+    return fallback if fallback in {"SUBSCRIBE", "WATCH", "AVOID"} else "WATCH"
+
+
+def _normalize_ipo_investment_advice(raw_items, ipo_context: list[dict] | None) -> list[dict]:
+    contexts = [item for item in (ipo_context or []) if isinstance(item, dict)]
+    if not contexts:
+        return []
+    by_id = {str(item.get("ipo_id") or ""): item for item in contexts}
+    by_code = {(str(item.get("market") or ""), str(item.get("code") or "").upper()): item for item in contexts}
+    if not isinstance(raw_items, list) or not raw_items:
+        return contexts
+
+    normalized = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        context = by_id.get(str(item.get("ipo_id") or item.get("id") or ""))
+        if not context:
+            market = str(item.get("market") or "").strip().upper()
+            code = str(item.get("code") or "").strip().upper()
+            context = by_code.get((market, code))
+        if not context:
+            continue
+
+        decision = _normalize_ipo_advice_decision(
+            item.get("decision") or item.get("recommendation") or item.get("action"),
+            context.get("decision") or "WATCH",
+        )
+        plan = _ipo_sell_plan(
+            decision,
+            _normalize_ai_number(item.get("expected_profit_pct"), context.get("expected_profit_pct") or 0),
+            context.get("listing_date") or "",
+            context.get("market") or "",
+        )
+        evidence = [
+            _clip_text(v, 180)
+            for v in (item.get("evidence") if isinstance(item.get("evidence"), list) else context.get("evidence") or [])
+            if str(v or "").strip()
+        ]
+        if len(evidence) < 2:
+            evidence = [
+                f"打新胜率评分 {context.get('win_probability', 0)}%",
+                f"预期收益 {context.get('expected_profit_pct', 0)}%",
+                *evidence,
+            ][:4]
+
+        key = str(context.get("ipo_id") or context.get("code") or idx)
+        seen.add(key)
+        base = {**context}
+        suggested_price = _normalize_ai_number(item.get("suggested_price") or item.get("price"), base.get("suggested_price") or 0)
+        suggested_shares = _normalize_ai_number(item.get("suggested_shares") or item.get("shares"), base.get("suggested_shares") or 0)
+        if decision != "SUBSCRIBE" and not (item.get("suggested_shares") or item.get("shares")):
+            suggested_shares = 0
+        base.update({
+            "id": str(item.get("id") or context.get("id") or f"ipo-advice-{idx + 1}"),
+            "decision": decision,
+            "decision_label": item.get("decision_label") or {"SUBSCRIBE": "建议申购", "WATCH": "谨慎观察", "AVOID": "回避申购"}[decision],
+            "suggested_price": round(suggested_price, 4),
+            "suggested_shares": round(suggested_shares, 4),
+            "estimated_amount": round(suggested_price * suggested_shares, 2) if suggested_price > 0 and suggested_shares > 0 else 0,
+            "reason": _clip_text(item.get("reason") or item.get("action") or context.get("reason") or "", 360),
+            "sell_timing": _clip_text(item.get("sell_timing") or item.get("suggested_sell_timing") or plan["sell_timing"], 260),
+            "take_profit": _clip_text(item.get("take_profit") or plan["take_profit"], 220),
+            "stop_loss": _clip_text(item.get("stop_loss") or plan["stop_loss"], 220),
+            "evidence": evidence[:6],
+            "confidence_score": round(max(0, min(100, _normalize_ai_number(item.get("confidence_score") or item.get("confidence"), context.get("confidence_score") or 60))), 1),
+            "risk_note": _clip_text(item.get("risk_note") or item.get("risk_warning") or context.get("risk_note") or "", 260),
+        })
+        normalized.append(base)
+
+    normalized.extend([
+        item for item in contexts
+        if str(item.get("ipo_id") or item.get("code") or "") not in seen
+    ])
+    return normalized
 
 
 def _latest_today_asset_analysis(db: Session, assets: list[Asset]) -> dict:
@@ -1598,6 +2105,7 @@ def _normalize_investment_advice(
     budget_status: list[dict],
     market_snapshot: dict | None = None,
     diagnostics: list[dict] | None = None,
+    ipo_context: list[dict] | None = None,
     asset_scope: str = "all",
 ) -> dict:
     if not isinstance(raw, dict):
@@ -1606,6 +2114,9 @@ def _normalize_investment_advice(
     raw_items = raw.get("advice") or raw.get("recommendations") or []
     if not isinstance(raw_items, list):
         raw_items = []
+    raw_ipo_items = raw.get("ipo_advice") or raw.get("ipo_recommendations") or []
+    if not isinstance(raw_ipo_items, list):
+        raw_ipo_items = []
     asset_scope = _normalize_asset_scope(asset_scope, "all")
     market_snapshot = market_snapshot or raw.get("market_snapshot") or {}
 
@@ -1724,9 +2235,11 @@ def _normalize_investment_advice(
     summary = strip_model_thinking(raw.get("summary") or ("已生成投资建议" if normalized else "暂无符合额度和行情约束的投资建议"))
     market_context = raw.get("market_context") if isinstance(raw.get("market_context"), dict) else {}
     decision_audit = raw.get("decision_audit") if isinstance(raw.get("decision_audit"), list) else []
+    ipo_advice = _normalize_ipo_investment_advice(raw_ipo_items, ipo_context)
     return sanitize_ai_payload({
         "summary": summary,
         "advice": normalized,
+        "ipo_advice": ipo_advice,
         "budget_status": budget_status,
         "market_context": market_context,
         "market_snapshot": market_snapshot,
@@ -2553,6 +3066,79 @@ def get_latest_ipo_analysis(db: Session = Depends(get_db)):
     raise HTTPException(status_code=404, detail="暂无新股打新分析记录")
 
 
+@app.get("/api/ipo/trades", response_model=list[IPOTradeResponse])
+def list_ipo_trades(
+    market: Optional[str] = Query(None),
+    code: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    query = db.query(IPOTradeRecord)
+    if market:
+        query = query.filter(IPOTradeRecord.market == market.strip().upper())
+    if code:
+        query = query.filter(IPOTradeRecord.code == code.strip().upper())
+    if platform:
+        query = query.filter(IPOTradeRecord.platform == platform.strip())
+    records = query.order_by(IPOTradeRecord.trade_date.desc(), IPOTradeRecord.created_at.desc()).all()
+    return [_serialize_ipo_trade(record) for record in records]
+
+
+@app.post("/api/ipo/trades", response_model=IPOTradeResponse)
+def create_ipo_trade(req: IPOTradeCreate, db: Session = Depends(get_db)):
+    trade_type = _normalize_ipo_trade_type(req.trade_type)
+    if trade_type not in {"SUBSCRIBE", "SELL"}:
+        raise HTTPException(status_code=400, detail="新股交易类型只能是 SUBSCRIBE 或 SELL")
+
+    market = str(req.market or "").strip().upper()
+    if market not in {"A", "HK", "US"}:
+        raise HTTPException(status_code=400, detail="新股市场只能是 A/HK/US")
+
+    code = str(req.code or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="新股代码不能为空")
+
+    shares = _normalize_ai_number(req.shares, 0)
+    price = _normalize_ai_number(req.price, 0)
+    fee = max(0.0, _normalize_ai_number(req.fee, 0))
+    if shares <= 0 or price <= 0:
+        raise HTTPException(status_code=400, detail="新股交易份额和价格必须大于 0")
+
+    platform = str(req.platform or "").strip()
+    currency = str(req.currency or _market_currency(market)).strip().upper() or _market_currency(market)
+    realized_pnl = 0.0
+    if trade_type == "SELL":
+        preview = _ipo_sale_preview(db, market, code, platform, shares, price, fee)
+        realized_pnl = preview["realized_pnl"]
+
+    record = IPOTradeRecord(
+        ipo_id=str(req.ipo_id or ""),
+        code=code,
+        name=str(req.name or code).strip() or code,
+        market=market,
+        platform=platform,
+        currency=currency,
+        trade_type=trade_type,
+        shares=shares,
+        price=price,
+        fee=fee,
+        trade_date=req.trade_date or date.today().isoformat(),
+        realized_pnl=realized_pnl,
+        analysis_snapshot_json=json.dumps(req.analysis_snapshot or {}, ensure_ascii=False, default=str),
+        advice_snapshot_json=json.dumps(req.advice_snapshot or {}, ensure_ascii=False, default=str),
+        note=str(req.note or "").strip(),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return _serialize_ipo_trade(record)
+
+
+@app.get("/api/ipo/realized-pnl", response_model=IPORealizedPnlResponse)
+def get_ipo_realized_pnl(db: Session = Depends(get_db)):
+    return _ipo_realized_pnl(db)
+
+
 @app.post("/api/market/lookup", response_model=MarketLookupResponse)
 def market_lookup(req: MarketLookupRequest, db: Session = Depends(get_db)):
     providers = _read_providers(db)
@@ -3276,6 +3862,7 @@ def run_investment_advice(
     budget_status = _investment_budget_status(budgets, all_assets)
     asset_items, target_items = _candidate_investment_targets(db, budgets, assets, providers)
     today_analysis = _latest_today_asset_analysis(db, assets)
+    ipo_context = _compact_ipo_advice_context(db, budget_status)
     personality = get_setting(db, "ai_personality") or "balanced"
     report_style = get_setting(db, "ai_report_style") or "professional"
 
@@ -3294,7 +3881,8 @@ def run_investment_advice(
         asset_items,
         target_items,
         today_analysis,
-        asset_scope,
+        ipo_context=ipo_context,
+        asset_scope=asset_scope,
     )
 
     try:
@@ -3315,6 +3903,7 @@ def run_investment_advice(
 
     result = _normalize_investment_advice(
         raw, budgets, assets, target_items, budget_status, market_snapshot,
+        ipo_context=ipo_context,
         asset_scope=asset_scope,
     )
     # 持久化投资建议到数据库
@@ -3322,6 +3911,7 @@ def run_investment_advice(
     record = InvestmentAdviceRecord(
         summary=result.get('summary', ''),
         advice_json=json.dumps(result.get('advice', []), ensure_ascii=False, default=str),
+        ipo_advice_json=json.dumps(result.get('ipo_advice', []), ensure_ascii=False, default=str),
         budget_status_json=json.dumps(result.get('budget_status', []), ensure_ascii=False, default=str),
     )
     db.add(record)
@@ -3344,6 +3934,7 @@ def get_latest_investment_advice(db: Session = Depends(get_db)):
     if not record:
         raise HTTPException(status_code=404, detail='暂无投资建议记录')
     advice = json.loads(record.advice_json or '[]')
+    ipo_advice = _safe_json_loads(getattr(record, "ipo_advice_json", "[]"), [])
     advice_sources = {
         _normalize_asset_scope(item.get("asset_source"), "all")
         for item in advice
@@ -3353,6 +3944,7 @@ def get_latest_investment_advice(db: Session = Depends(get_db)):
     return {
         'summary': record.summary or '',
         'advice': advice,
+        'ipo_advice': ipo_advice if isinstance(ipo_advice, list) else [],
         'budget_status': json.loads(record.budget_status_json or '[]'),
         'market_context': {},
         'market_snapshot': {},
@@ -3376,6 +3968,7 @@ def _latest_investment_advice_context(db: Session) -> dict:
         return {
             "summary": record.summary or "",
             "advice": _safe_json_loads(record.advice_json, [])[:12],
+            "ipo_advice": _safe_json_loads(getattr(record, "ipo_advice_json", "[]"), [])[:12],
             "budget_status": _safe_json_loads(record.budget_status_json, []),
             "created_at": record.created_at.isoformat() if record.created_at else "",
         }
@@ -3549,6 +4142,8 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
     latest_analysis = _latest_successful_analysis(db)
     latest_asset_analysis = _latest_today_asset_analysis(db, assets)
     latest_advice = _latest_investment_advice_context(db)
+    latest_ipo_analysis = _latest_ipo_analysis_context(db)
+    ipo_pnl = _ipo_realized_pnl(db)
 
     total_cost = sum(item.get("total_cost", 0) for item in asset_items)
     total_market_value = sum(item.get("market_value", 0) for item in asset_items)
@@ -3558,6 +4153,7 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
         "total_market_value": round(total_market_value, 2),
         "total_pnl": round(total_pnl, 2),
         "total_pnl_percent": round((total_pnl / total_cost * 100) if total_cost else 0, 2),
+        "ipo_realized_pnl": ipo_pnl.get("realized_pnl", 0),
         "holding_count": len(asset_items),
         "target_count": len(target_items),
         "removed_target_count": removed_targets_count,
@@ -3602,6 +4198,13 @@ def _build_ai_chat_context(db: Session, include_live_quotes: bool = True) -> tup
         } if latest_analysis else {},
         "latest_asset_analysis_today": latest_asset_analysis,
         "latest_investment_advice": latest_advice,
+        "latest_ipo_analysis": {
+            "summary": latest_ipo_analysis.get("summary", ""),
+            "analyses": (latest_ipo_analysis.get("analyses") or [])[:12],
+            "market_view": latest_ipo_analysis.get("market_view") or {},
+            "generated_at": latest_ipo_analysis.get("generated_at") or "",
+        } if latest_ipo_analysis else {},
+        "ipo_realized_pnl": ipo_pnl,
     }
     meta = {
         "generated_at": context["generated_at"],

@@ -33,7 +33,30 @@ def _migrate():
             ("result_json", "TEXT DEFAULT '{}'"),
             ("source_status_json", "TEXT DEFAULT '{}'"),
         ]),
+        ("investment_advice_records", [
+            ("ipo_advice_json", "TEXT DEFAULT '[]'"),
+        ]),
+        ("ipo_trade_records", [
+            ("ipo_id", "VARCHAR(100) DEFAULT ''"),
+            ("code", "VARCHAR(30) DEFAULT ''"),
+            ("name", "VARCHAR(100) DEFAULT ''"),
+            ("market", "VARCHAR(10) DEFAULT ''"),
+            ("platform", "VARCHAR(50) DEFAULT ''"),
+            ("currency", "VARCHAR(10) DEFAULT 'CNY'"),
+            ("trade_type", "VARCHAR(20) DEFAULT ''"),
+            ("shares", "FLOAT DEFAULT 0"),
+            ("price", "FLOAT DEFAULT 0"),
+            ("fee", "FLOAT DEFAULT 0"),
+            ("trade_date", "VARCHAR(20) DEFAULT ''"),
+            ("realized_pnl", "FLOAT DEFAULT 0"),
+            ("analysis_snapshot_json", "TEXT DEFAULT '{}'"),
+            ("advice_snapshot_json", "TEXT DEFAULT '{}'"),
+            ("note", "TEXT DEFAULT ''"),
+            ("created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP"),
+        ]),
     ]:
+        if not inspector.has_table(table):
+            continue
         existing = {c["name"] for c in inspector.get_columns(table)}
         for col_name, col_type in col_defs:
             if col_name not in existing:

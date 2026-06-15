@@ -200,9 +200,49 @@ export interface InvestmentAdviceItem {
   asset_id: number | null
 }
 
+export interface IPOInvestmentAdviceItem {
+  id: string
+  ipo_id: string
+  market: IPOMarket | string
+  market_label: string
+  code: string
+  name: string
+  decision: 'SUBSCRIBE' | 'WATCH' | 'AVOID'
+  decision_label: string
+  suggested_shares: number
+  suggested_price: number
+  estimated_amount: number
+  currency: string
+  currency_label: string
+  platform: string
+  win_probability: number
+  expected_profit_pct: number
+  expected_profit_range: string
+  confidence_score: number
+  reason: string
+  sell_timing: string
+  take_profit: string
+  stop_loss: string
+  evidence?: string[]
+  risk_note: string
+  key_reasons?: string[]
+  comment_insights?: string[]
+  risk_flags?: string[]
+  apply_date?: string
+  listing_date?: string
+  issue_price?: number | null
+  price_range?: string
+  lot_size?: number
+  source_label?: string
+  source_url?: string
+  analysis_snapshot?: any
+  generated_at?: string
+}
+
 export interface InvestmentAdviceResponse {
   summary: string
   advice: InvestmentAdviceItem[]
+  ipo_advice: IPOInvestmentAdviceItem[]
   budget_status: any[]
   market_context?: {
     regime?: string
@@ -315,6 +355,48 @@ export interface IPOProviders {
   defaults: Record<string, string>
 }
 
+export interface IPOTradeCreate {
+  ipo_id?: string
+  code: string
+  name?: string
+  market: string
+  platform?: string
+  currency?: string
+  trade_type: 'SUBSCRIBE' | 'SELL'
+  shares: number
+  price: number
+  fee?: number
+  trade_date?: string
+  analysis_snapshot?: any
+  advice_snapshot?: any
+  note?: string
+}
+
+export interface IPOTradeRecord extends IPOTradeCreate {
+  id: number
+  realized_pnl: number
+  created_at: string
+  analysis_snapshot: any
+  advice_snapshot: any
+}
+
+export interface IPORealizedPnl {
+  realized_pnl: number
+  total_sell_amount: number
+  total_cost_basis: number
+  total_fee: number
+  closed_trades: number
+  open_positions: Array<{
+    market: string
+    code: string
+    platform: string
+    currency: string
+    shares: number
+    cost_basis: number
+    avg_cost: number
+  }>
+}
+
 export interface AIChatMessage {
   role: 'user' | 'assistant'
   content: string
@@ -415,6 +497,12 @@ export const ipoApi = {
     api.get<IPOAnalysisResponse>('/ipo/latest-analysis').then(r => r.data),
   providers: () =>
     api.get<IPOProviders>('/ipo/providers').then(r => r.data),
+  trades: (params?: { market?: string; code?: string; platform?: string }) =>
+    api.get<IPOTradeRecord[]>('/ipo/trades', { params }).then(r => r.data),
+  createTrade: (data: IPOTradeCreate) =>
+    api.post<IPOTradeRecord>('/ipo/trades', data).then(r => r.data),
+  realizedPnl: () =>
+    api.get<IPORealizedPnl>('/ipo/realized-pnl').then(r => r.data),
 }
 
 export const chatApi = {

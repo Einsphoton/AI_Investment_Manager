@@ -131,11 +131,12 @@ class IPOTradeRecord(Base):
     market = Column(String(10), nullable=False, index=True)
     platform = Column(String(50), default="", index=True)
     currency = Column(String(10), default="CNY")
-    trade_type = Column(String(20), nullable=False)  # SUBSCRIBE, SELL
+    trade_type = Column(String(20), nullable=False)  # APPLY, SUBSCRIBE, NO_WIN, SELL
     shares = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
     fee = Column(Float, default=0.0)
     trade_date = Column(String(20), nullable=False)
+    follow_up_date = Column(String(20), default="")
     realized_pnl = Column(Float, default=0.0)
     analysis_snapshot_json = Column(Text, default="{}")
     advice_snapshot_json = Column(Text, default="{}")

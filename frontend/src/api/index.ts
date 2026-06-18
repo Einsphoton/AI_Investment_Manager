@@ -230,6 +230,7 @@ export interface IPOInvestmentAdviceItem {
   risk_flags?: string[]
   apply_date?: string
   listing_date?: string
+  follow_up_date?: string
   issue_price?: number | null
   price_range?: string
   lot_size?: number
@@ -362,11 +363,12 @@ export interface IPOTradeCreate {
   market: string
   platform?: string
   currency?: string
-  trade_type: 'SUBSCRIBE' | 'SELL'
+  trade_type: 'APPLY' | 'SUBSCRIBE' | 'NO_WIN' | 'SELL'
   shares: number
   price: number
   fee?: number
   trade_date?: string
+  follow_up_date?: string
   analysis_snapshot?: any
   advice_snapshot?: any
   note?: string

@@ -75,19 +75,119 @@ const ipoTradeMatchesAdvice = (trade: IPOTradeRecord, item: IPOInvestmentAdviceI
   return sameMarket && sameCode && samePlatform
 }
 
+const ipoTradeMatchesTrade = (trade: IPOTradeRecord, base: IPOTradeRecord) => {
+  const tradeIpoId = String(trade.ipo_id || '').trim()
+  const baseIpoId = String(base.ipo_id || '').trim()
+  if (tradeIpoId && baseIpoId && tradeIpoId === baseIpoId) return true
+
+  const sameMarket = String(trade.market || '').toUpperCase() === String(base.market || '').toUpperCase()
+  const sameCode = String(trade.code || '').toUpperCase() === String(base.code || '').toUpperCase()
+  const tradePlatform = String(trade.platform || '').trim()
+  const basePlatform = String(base.platform || '').trim()
+  const samePlatform = !tradePlatform || !basePlatform || tradePlatform === basePlatform
+  return sameMarket && sameCode && samePlatform
+}
+
+type IpoAdviceTradeType = 'APPLY' | 'SUBSCRIBE' | 'NO_WIN' | 'SELL'
+type IpoAdviceStatus = 'applied' | 'won' | 'missed' | 'sold'
+
+const ipoTradeTypeLabel: Record<IpoAdviceTradeType, string> = {
+  APPLY: '记录申购',
+  SUBSCRIBE: '确认中签',
+  NO_WIN: '记录未中签',
+  SELL: '记录新股卖出',
+}
+
+const ipoTradeDateLabel: Record<IpoAdviceTradeType, string> = {
+  APPLY: '申购日期',
+  SUBSCRIBE: '中签确认日期',
+  NO_WIN: '确认日期',
+  SELL: '卖出日期',
+}
+
+const ipoTradePriceLabel: Record<IpoAdviceTradeType, string> = {
+  APPLY: '参考价',
+  SUBSCRIBE: '中签成本价',
+  NO_WIN: '价格',
+  SELL: '成交价',
+}
+
+const currencyLabel = (currency?: string) => {
+  if (currency === 'HKD') return '港元'
+  if (currency === 'USD') return '美元'
+  return '人民币'
+}
+
+const ipoAdviceFromApplyRecord = (record: IPOTradeRecord): IPOInvestmentAdviceItem => {
+  const snapshot = (record.advice_snapshot || {}) as Partial<IPOInvestmentAdviceItem>
+  const currency = record.currency || snapshot.currency || 'CNY'
+  const suggestedShares = Number(record.shares || snapshot.suggested_shares || snapshot.lot_size || 1)
+  const suggestedPrice = Number(record.price || snapshot.suggested_price || snapshot.issue_price || 0)
+  return {
+    id: `ipo-follow-up-${record.id}`,
+    ipo_id: record.ipo_id || snapshot.ipo_id || '',
+    market: record.market || snapshot.market || '',
+    market_label: snapshot.market_label || String(record.market || ''),
+    code: record.code || snapshot.code || '',
+    name: record.name || snapshot.name || record.code || '',
+    decision: 'SUBSCRIBE',
+    decision_label: '待确认中签',
+    suggested_shares: suggestedShares,
+    suggested_price: suggestedPrice,
+    estimated_amount: suggestedShares * suggestedPrice,
+    currency,
+    currency_label: snapshot.currency_label || currencyLabel(currency),
+    platform: record.platform || snapshot.platform || '',
+    win_probability: Number(snapshot.win_probability || 0),
+    expected_profit_pct: Number(snapshot.expected_profit_pct || 0),
+    expected_profit_range: snapshot.expected_profit_range || '',
+    confidence_score: Number(snapshot.confidence_score || 0),
+    reason: snapshot.reason || record.note || '',
+    sell_timing: snapshot.sell_timing || '',
+    take_profit: snapshot.take_profit || '',
+    stop_loss: snapshot.stop_loss || '',
+    evidence: snapshot.evidence || [],
+    risk_note: snapshot.risk_note || '',
+    key_reasons: snapshot.key_reasons || [],
+    comment_insights: snapshot.comment_insights || [],
+    risk_flags: snapshot.risk_flags || [],
+    apply_date: snapshot.apply_date || record.trade_date || '',
+    listing_date: snapshot.listing_date || '',
+    follow_up_date: record.follow_up_date || snapshot.follow_up_date || '',
+    issue_price: snapshot.issue_price ?? suggestedPrice,
+    price_range: snapshot.price_range || '',
+    lot_size: snapshot.lot_size || suggestedShares,
+    source_label: snapshot.source_label || '',
+    source_url: snapshot.source_url || '',
+    analysis_snapshot: record.analysis_snapshot || snapshot.analysis_snapshot || {},
+    generated_at: snapshot.generated_at || '',
+  }
+}
+
+const buildPendingIpoFollowUps = (trades: IPOTradeRecord[]) => (
+  trades
+    .filter(trade => trade.trade_type === 'APPLY')
+    .filter(applyTrade => !trades.some(trade => (
+      ipoTradeMatchesTrade(trade, applyTrade)
+      && ['SUBSCRIBE', 'NO_WIN'].includes(trade.trade_type)
+    )))
+    .map(ipoAdviceFromApplyRecord)
+)
+
 export default function InvestmentAdvice() {
   const aiCtx = useAIWorkContext()
   const [initialLoading, setInitialLoading] = useState(true)
   const [acceptingId, setAcceptingId] = useState<string | null>(null)
   const [result, setResult] = useState<InvestmentAdviceResponse | null>(null)
   const [statuses, setStatuses] = useState<Record<string, 'accepted' | 'dismissed'>>({})
-  const [ipoStatuses, setIpoStatuses] = useState<Record<string, 'subscribed' | 'sold'>>({})
+  const [ipoStatuses, setIpoStatuses] = useState<Record<string, IpoAdviceStatus>>({})
+  const [pendingIpoFollowUps, setPendingIpoFollowUps] = useState<IPOInvestmentAdviceItem[]>([])
   const [budgetStatus, setBudgetStatus] = useState<any[]>([])
   const [ipoTradeForm] = Form.useForm()
-  const [ipoTradeModal, setIpoTradeModal] = useState<{ open: boolean; item: IPOInvestmentAdviceItem | null; tradeType: 'SUBSCRIBE' | 'SELL' }>({
+  const [ipoTradeModal, setIpoTradeModal] = useState<{ open: boolean; item: IPOInvestmentAdviceItem | null; tradeType: IpoAdviceTradeType }>({
     open: false,
     item: null,
-    tradeType: 'SUBSCRIBE',
+    tradeType: 'APPLY',
   })
   const [recordingIpoTrade, setRecordingIpoTrade] = useState(false)
   const [assetScope, setAssetScope] = useState<AssetScope>(() => {
@@ -143,6 +243,15 @@ export default function InvestmentAdvice() {
     localStorage.setItem('investment_advice_asset_scope', nextScope)
   }
 
+  const loadPendingIpoFollowUps = useCallback(async () => {
+    try {
+      const trades = await ipoApi.trades()
+      setPendingIpoFollowUps(buildPendingIpoFollowUps(trades))
+    } catch {
+      setPendingIpoFollowUps([])
+    }
+  }, [])
+
   const loadIpoTradeStatuses = useCallback(async (items: IPOInvestmentAdviceItem[] = result?.ipo_advice || []) => {
     if (!items.length) {
       setIpoStatuses({})
@@ -150,13 +259,17 @@ export default function InvestmentAdvice() {
     }
     try {
       const trades = await ipoApi.trades()
-      const next: Record<string, 'subscribed' | 'sold'> = {}
+      const next: Record<string, IpoAdviceStatus> = {}
       items.forEach(item => {
         const matched = trades.filter(trade => ipoTradeMatchesAdvice(trade, item))
         if (matched.some(trade => trade.trade_type === 'SELL')) {
           next[item.id] = 'sold'
         } else if (matched.some(trade => trade.trade_type === 'SUBSCRIBE')) {
-          next[item.id] = 'subscribed'
+          next[item.id] = 'won'
+        } else if (matched.some(trade => trade.trade_type === 'NO_WIN')) {
+          next[item.id] = 'missed'
+        } else if (matched.some(trade => trade.trade_type === 'APPLY')) {
+          next[item.id] = 'applied'
         }
       })
       setIpoStatuses(next)
@@ -167,7 +280,8 @@ export default function InvestmentAdvice() {
 
   useEffect(() => {
     loadIpoTradeStatuses(result?.ipo_advice || [])
-  }, [result?.ipo_advice, loadIpoTradeStatuses])
+    loadPendingIpoFollowUps()
+  }, [result?.ipo_advice, loadIpoTradeStatuses, loadPendingIpoFollowUps])
 
   const runAdvice = async () => {
     aiCtx.startTask(`AI 投资建议（${assetScopeLabel(assetScope)}）`)
@@ -233,23 +347,33 @@ export default function InvestmentAdvice() {
     message.success('已放弃该建议')
   }
 
-  const openIpoTradeModal = (item: IPOInvestmentAdviceItem, tradeType: 'SUBSCRIBE' | 'SELL') => {
+  const openIpoTradeModal = (item: IPOInvestmentAdviceItem, tradeType: IpoAdviceTradeType) => {
     setIpoTradeModal({ open: true, item, tradeType })
+    const isNoWin = tradeType === 'NO_WIN'
+    const fallbackShares = item.suggested_shares || item.lot_size || 1
+    const fallbackPrice = item.suggested_price || item.issue_price || 0
+    const defaultNote = tradeType === 'APPLY'
+      ? `按 AI 新股建议记录申购申请，${item.follow_up_date ? `${item.follow_up_date} 回访确认是否中签` : '待回访确认是否中签'}：${item.reason || ''}`
+      : tradeType === 'SUBSCRIBE'
+        ? '申购结束后回访：确认已中签，记录实际中签数量。'
+        : tradeType === 'NO_WIN'
+          ? '申购结束后回访：确认未中签。'
+          : `按 AI 新股卖出计划记录卖出：${item.sell_timing || ''}`
     ipoTradeForm.setFieldsValue({
       platform: item.platform || '',
       trade_date: dayjs(),
-      shares: item.suggested_shares || item.lot_size || 1,
-      price: item.suggested_price || item.issue_price || 0,
+      shares: isNoWin ? 0 : fallbackShares,
+      price: isNoWin ? 0 : fallbackPrice,
       fee: 0,
-      note: tradeType === 'SUBSCRIBE'
-        ? `按 AI 新股建议记录申购：${item.reason || ''}`
-        : `按 AI 新股卖出计划记录卖出：${item.sell_timing || ''}`,
+      follow_up_date: item.follow_up_date ? dayjs(item.follow_up_date) : dayjs().add(3, 'day'),
+      note: defaultNote,
     })
   }
 
   const submitIpoTrade = async () => {
     if (!ipoTradeModal.item) return
     const item = ipoTradeModal.item
+    const tradeType = ipoTradeModal.tradeType
     setRecordingIpoTrade(true)
     try {
       const values = await ipoTradeForm.validateFields()
@@ -260,26 +384,39 @@ export default function InvestmentAdvice() {
         market: item.market,
         platform: values.platform || item.platform || '',
         currency: item.currency || 'CNY',
-        trade_type: ipoTradeModal.tradeType,
-        shares: Number(values.shares || 0),
-        price: Number(values.price || 0),
-        fee: Number(values.fee || 0),
+        trade_type: tradeType,
+        shares: tradeType === 'NO_WIN' ? 0 : Number(values.shares || 0),
+        price: tradeType === 'NO_WIN' ? 0 : Number(values.price || 0),
+        fee: tradeType === 'NO_WIN' ? 0 : Number(values.fee || 0),
         trade_date: values.trade_date ? values.trade_date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+        follow_up_date: values.follow_up_date ? values.follow_up_date.format('YYYY-MM-DD') : item.follow_up_date || '',
         analysis_snapshot: item.analysis_snapshot || {},
         advice_snapshot: item,
         note: values.note || '',
       })
+      const nextStatus: IpoAdviceStatus = tradeType === 'SELL'
+        ? 'sold'
+        : tradeType === 'SUBSCRIBE'
+          ? 'won'
+          : tradeType === 'NO_WIN'
+            ? 'missed'
+            : 'applied'
       setIpoStatuses(prev => ({
         ...prev,
-        [item.id]: ipoTradeModal.tradeType === 'SELL' ? 'sold' : 'subscribed',
+        [item.id]: nextStatus,
       }))
-      setIpoTradeModal({ open: false, item: null, tradeType: 'SUBSCRIBE' })
-      if (ipoTradeModal.tradeType === 'SELL') {
+      setIpoTradeModal({ open: false, item: null, tradeType: 'APPLY' })
+      if (tradeType === 'SELL') {
         message.success(`已记录卖出，已实现盈亏 ${formatAmount(record.realized_pnl || 0, item.currency)}`)
+      } else if (tradeType === 'SUBSCRIBE') {
+        message.success('已确认中签，后续可记录卖出')
+      } else if (tradeType === 'NO_WIN') {
+        message.success('已记录未中签')
       } else {
-        message.success('已记录新股申购')
+        message.success(`已记录申购，${record.follow_up_date ? `${record.follow_up_date} 回访确认是否中签` : '待回访确认是否中签'}`)
       }
       loadIpoTradeStatuses()
+      loadPendingIpoFollowUps()
     } catch (e: any) {
       if (e?.errorFields) return
       message.error(e?.response?.data?.detail || e?.message || '新股交易记录失败')
@@ -534,123 +671,6 @@ export default function InvestmentAdvice() {
         </Space>
       </Card>
 
-      {/* IPO Advice List */}
-      <Card
-        title={
-          <Space>
-            <RocketOutlined style={goldStyle} />
-            <span>新股申购建议</span>
-          </Space>
-        }
-      >
-        {!result ? (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="点击上方按钮生成 AI 投资建议" />
-        ) : !(result.ipo_advice || []).length ? (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无新股申购建议" />
-        ) : (
-          <Row gutter={[12, 12]}>
-            {(result.ipo_advice || []).map(item => {
-              const color = ipoDecisionColor(item.decision)
-              const status = ipoStatuses[item.id]
-              return (
-                <Col xs={24} lg={12} xl={8} key={item.id || item.ipo_id || item.code}>
-                  <div style={{
-                    height: '100%',
-                    padding: 14,
-                    borderRadius: 8,
-                    background: status === 'sold' ? 'rgba(64,210,128,0.04)' : 'rgba(255,255,255,0.025)',
-                    border: `1px solid ${color}33`,
-                  }}>
-                    <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                      <Space style={{ width: '100%', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                        <Space direction="vertical" size={0}>
-                          <Space size={6} style={{ flexWrap: 'wrap' }}>
-                            <Text strong style={{ color: '#e8e6e3' }}>{item.name || item.code}</Text>
-                            <Text style={{ color: '#5c5a55', fontSize: 12 }}>{item.code}</Text>
-                          </Space>
-                          <Text style={{ color: '#8f8a82', fontSize: 12 }}>
-                            {item.market_label || item.market} · 上市 {item.listing_date || '-'}
-                          </Text>
-                        </Space>
-                        <Tag style={{ margin: 0, borderRadius: 4, color, background: `${color}18`, borderColor: `${color}44` }}>
-                          {item.decision_label}
-                        </Tag>
-                      </Space>
-
-                      <Row gutter={10}>
-                        <Col span={12}>
-                          <Text style={{ color: '#5c5a55', fontSize: 11 }}>胜率评分</Text>
-                          <Progress percent={Math.round(item.win_probability || 0)} size="small" strokeColor={color} trailColor="rgba(255,255,255,0.06)" />
-                        </Col>
-                        <Col span={12}>
-                          <Text style={{ color: '#5c5a55', fontSize: 11 }}>盈利预期</Text>
-                          <div style={{ color: (item.expected_profit_pct || 0) >= 0 ? '#40d280' : '#ff4d4f', fontWeight: 700, fontSize: 18 }}>
-                            {formatSignedPercent(item.expected_profit_pct)}
-                          </div>
-                          <Text style={{ color: '#8f8a82', fontSize: 11 }}>{item.expected_profit_range || '-'}</Text>
-                        </Col>
-                      </Row>
-
-                      <div style={{ padding: 10, borderRadius: 8, background: 'rgba(201,168,76,0.05)', border: '1px solid rgba(201,168,76,0.1)' }}>
-                        <Text style={{ color: '#c9a84c', fontSize: 12, display: 'block', marginBottom: 4 }}>卖出计划</Text>
-                        <Text style={{ color: '#cfcac1', fontSize: 12, lineHeight: 1.7, display: 'block' }}>{item.sell_timing || '-'}</Text>
-                        <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block', marginTop: 4 }}>止盈：{item.take_profit || '-'}</Text>
-                        <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止损：{item.stop_loss || '-'}</Text>
-                      </div>
-
-                      <Text style={{ color: '#cfcac1', fontSize: 12, lineHeight: 1.7 }}>
-                        {item.reason || '基于最新新股打新分析生成建议'}
-                      </Text>
-
-                      {(item.evidence || []).length ? (
-                        <Space direction="vertical" size={4} style={{ width: '100%' }}>
-                          {(item.evidence || []).slice(0, 3).map((evidence, idx) => (
-                            <Text key={idx} style={{ color: '#b0aea8', fontSize: 12 }}>• {evidence}</Text>
-                          ))}
-                        </Space>
-                      ) : null}
-
-                      <Space size={6} style={{ justifyContent: 'space-between', width: '100%', flexWrap: 'wrap' }}>
-                        <Text style={{ color: '#8f8a82', fontSize: 12 }}>
-                          {item.suggested_price ? `参考价 ${formatAmount(item.suggested_price, item.currency)}` : '参考价 -'}
-                          {item.suggested_shares ? ` · ${item.suggested_shares} 股` : ''}
-                        </Text>
-                        <Space size={6}>
-                          {status === 'subscribed' ? (
-                            <Tag color="#40d280" style={{ border: 'none', color: '#fff', borderRadius: 4, margin: 0 }}>已申购</Tag>
-                          ) : null}
-                          {status === 'sold' ? (
-                            <Tag color="#40d280" style={{ border: 'none', color: '#fff', borderRadius: 4, margin: 0 }}>已卖出</Tag>
-                          ) : null}
-                          <Button
-                            size="small"
-                            type={item.decision === 'SUBSCRIBE' ? 'primary' : 'default'}
-                            icon={<CheckOutlined />}
-                            disabled={item.decision !== 'SUBSCRIBE'}
-                            onClick={() => openIpoTradeModal(item, 'SUBSCRIBE')}
-                            style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
-                          >
-                            记录申购
-                          </Button>
-                          <Button
-                            size="small"
-                            icon={<DollarOutlined />}
-                            onClick={() => openIpoTradeModal(item, 'SELL')}
-                            style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
-                          >
-                            记录卖出
-                          </Button>
-                        </Space>
-                      </Space>
-                    </Space>
-                  </div>
-                </Col>
-              )
-            })}
-          </Row>
-        )}
-      </Card>
-
       {/* Advice List */}
       <Card
         title={
@@ -781,6 +801,196 @@ export default function InvestmentAdvice() {
           </Space>
         )}
       </Card>
+
+      {/* IPO Advice List */}
+      <Card
+        title={
+          <Space>
+            <RocketOutlined style={goldStyle} />
+            <span>新股申购建议</span>
+          </Space>
+        }
+      >
+        {!result && !pendingIpoFollowUps.length ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="点击上方按钮生成 AI 投资建议" />
+        ) : !(result?.ipo_advice || []).length && !pendingIpoFollowUps.length ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无新股申购建议" />
+        ) : (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            {pendingIpoFollowUps.length ? (
+              <div style={{ padding: 12, borderRadius: 8, background: 'rgba(201,168,76,0.06)', border: '1px solid rgba(201,168,76,0.14)' }}>
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  <Text style={{ color: '#c9a84c', fontSize: 12, fontWeight: 600 }}>待回访确认中签结果</Text>
+                  {pendingIpoFollowUps.map(item => (
+                    <div key={item.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <Space direction="vertical" size={0}>
+                        <Text style={{ color: '#e8e6e3', fontSize: 13, fontWeight: 600 }}>{item.name || item.code}</Text>
+                        <Text style={{ color: '#8f8a82', fontSize: 12 }}>
+                          {item.market_label || item.market} · {item.platform || '未填平台'} · {item.follow_up_date ? `回访 ${item.follow_up_date}` : '待回访'}
+                        </Text>
+                      </Space>
+                      <Space size={6}>
+                        <Button
+                          size="small"
+                          icon={<CheckOutlined />}
+                          onClick={() => openIpoTradeModal(item, 'SUBSCRIBE')}
+                          style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                        >
+                          确认中签
+                        </Button>
+                        <Button
+                          size="small"
+                          icon={<CloseOutlined />}
+                          onClick={() => openIpoTradeModal(item, 'NO_WIN')}
+                          style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                        >
+                          未中签
+                        </Button>
+                      </Space>
+                    </div>
+                  ))}
+                </Space>
+              </div>
+            ) : null}
+            {(result?.ipo_advice || []).length ? (
+              <Row gutter={[12, 12]}>
+                {(result?.ipo_advice || []).map(item => {
+              const color = ipoDecisionColor(item.decision)
+              const status = ipoStatuses[item.id]
+              const statusLabel = status === 'applied'
+                ? '待回访'
+                : status === 'won'
+                  ? '已中签'
+                  : status === 'missed'
+                    ? '未中签'
+                    : status === 'sold'
+                      ? '已卖出'
+                      : ''
+              const followUpText = item.follow_up_date ? `回访 ${item.follow_up_date}` : ''
+              return (
+                <Col xs={24} lg={12} xl={8} key={item.id || item.ipo_id || item.code}>
+                  <div style={{
+                    height: '100%',
+                    padding: 14,
+                    borderRadius: 8,
+                    background: status === 'sold' ? 'rgba(64,210,128,0.04)' : 'rgba(255,255,255,0.025)',
+                    border: `1px solid ${color}33`,
+                  }}>
+                    <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                      <Space style={{ width: '100%', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <Space direction="vertical" size={0}>
+                          <Space size={6} style={{ flexWrap: 'wrap' }}>
+                            <Text strong style={{ color: '#e8e6e3' }}>{item.name || item.code}</Text>
+                            <Text style={{ color: '#5c5a55', fontSize: 12 }}>{item.code}</Text>
+                          </Space>
+                          <Text style={{ color: '#8f8a82', fontSize: 12 }}>
+                            {item.market_label || item.market} · 上市 {item.listing_date || '-'}
+                            {followUpText ? ` · ${followUpText}` : ''}
+                          </Text>
+                        </Space>
+                        <Tag style={{ margin: 0, borderRadius: 4, color, background: `${color}18`, borderColor: `${color}44` }}>
+                          {item.decision_label}
+                        </Tag>
+                      </Space>
+
+                      <Row gutter={10}>
+                        <Col span={12}>
+                          <Text style={{ color: '#5c5a55', fontSize: 11 }}>胜率评分</Text>
+                          <Progress percent={Math.round(item.win_probability || 0)} size="small" strokeColor={color} trailColor="rgba(255,255,255,0.06)" />
+                        </Col>
+                        <Col span={12}>
+                          <Text style={{ color: '#5c5a55', fontSize: 11 }}>盈利预期</Text>
+                          <div style={{ color: (item.expected_profit_pct || 0) >= 0 ? '#40d280' : '#ff4d4f', fontWeight: 700, fontSize: 18 }}>
+                            {formatSignedPercent(item.expected_profit_pct)}
+                          </div>
+                          <Text style={{ color: '#8f8a82', fontSize: 11 }}>{item.expected_profit_range || '-'}</Text>
+                        </Col>
+                      </Row>
+
+                      <div style={{ padding: 10, borderRadius: 8, background: 'rgba(201,168,76,0.05)', border: '1px solid rgba(201,168,76,0.1)' }}>
+                        <Text style={{ color: '#c9a84c', fontSize: 12, display: 'block', marginBottom: 4 }}>卖出计划</Text>
+                        <Text style={{ color: '#cfcac1', fontSize: 12, lineHeight: 1.7, display: 'block' }}>{item.sell_timing || '-'}</Text>
+                        <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block', marginTop: 4 }}>止盈：{item.take_profit || '-'}</Text>
+                        <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止损：{item.stop_loss || '-'}</Text>
+                      </div>
+
+                      <Text style={{ color: '#cfcac1', fontSize: 12, lineHeight: 1.7 }}>
+                        {item.reason || '基于最新新股打新分析生成建议'}
+                      </Text>
+
+                      {(item.evidence || []).length ? (
+                        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                          {(item.evidence || []).slice(0, 3).map((evidence, idx) => (
+                            <Text key={idx} style={{ color: '#b0aea8', fontSize: 12 }}>• {evidence}</Text>
+                          ))}
+                        </Space>
+                      ) : null}
+
+                      <Space size={6} style={{ justifyContent: 'space-between', width: '100%', flexWrap: 'wrap' }}>
+                        <Text style={{ color: '#8f8a82', fontSize: 12 }}>
+                          {item.suggested_price ? `参考价 ${formatAmount(item.suggested_price, item.currency)}` : '参考价 -'}
+                          {item.suggested_shares ? ` · ${item.suggested_shares} 股` : ''}
+                        </Text>
+                        <Space size={6} style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                          {statusLabel ? (
+                            <Tag color={status === 'missed' ? '#9a9892' : '#40d280'} style={{ border: 'none', color: '#fff', borderRadius: 4, margin: 0 }}>
+                              {statusLabel}
+                            </Tag>
+                          ) : null}
+                          {!status ? (
+                            <Button
+                              size="small"
+                              type="primary"
+                              icon={<CheckOutlined />}
+                              disabled={item.decision !== 'SUBSCRIBE'}
+                              onClick={() => openIpoTradeModal(item, 'APPLY')}
+                              style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                            >
+                              记录申购
+                            </Button>
+                          ) : null}
+                          {status === 'applied' ? (
+                            <>
+                              <Button
+                                size="small"
+                                icon={<CheckOutlined />}
+                                onClick={() => openIpoTradeModal(item, 'SUBSCRIBE')}
+                                style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                              >
+                                确认中签
+                              </Button>
+                              <Button
+                                size="small"
+                                icon={<CloseOutlined />}
+                                onClick={() => openIpoTradeModal(item, 'NO_WIN')}
+                                style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                              >
+                                未中签
+                              </Button>
+                            </>
+                          ) : null}
+                          {status === 'won' ? (
+                            <Button
+                              size="small"
+                              icon={<DollarOutlined />}
+                              onClick={() => openIpoTradeModal(item, 'SELL')}
+                              style={{ borderRadius: 6, height: 28, fontSize: 11, paddingInline: 8 }}
+                            >
+                              记录卖出
+                            </Button>
+                          ) : null}
+                        </Space>
+                      </Space>
+                    </Space>
+                  </div>
+                </Col>
+              )
+                })}
+              </Row>
+            ) : null}
+          </Space>
+        )}
+      </Card>
     </Space>
 
 {/* Analysis Modal */}
@@ -882,13 +1092,13 @@ export default function InvestmentAdvice() {
           <Space>
             <RocketOutlined style={goldStyle} />
             <span>
-              {ipoTradeModal.tradeType === 'SUBSCRIBE' ? '记录新股申购' : '记录新股卖出'}
+              {ipoTradeTypeLabel[ipoTradeModal.tradeType]}
               {ipoTradeModal.item ? ` · ${ipoTradeModal.item.name || ipoTradeModal.item.code}` : ''}
             </span>
           </Space>
         }
         open={ipoTradeModal.open}
-        onCancel={() => setIpoTradeModal({ open: false, item: null, tradeType: 'SUBSCRIBE' })}
+        onCancel={() => setIpoTradeModal({ open: false, item: null, tradeType: 'APPLY' })}
         onOk={submitIpoTrade}
         confirmLoading={recordingIpoTrade}
         okText="保存"
@@ -899,38 +1109,69 @@ export default function InvestmentAdvice() {
           <Row gutter={12}>
             <Col span={12}>
               <Form.Item name="platform" label="平台">
-                <Input placeholder="申购/卖出平台" />
+                <Input placeholder="申购/交易平台" />
               </Form.Item>
             </Col>
             <Col span={12}>
-              <Form.Item name="trade_date" label="交易日期" rules={[{ required: true, message: '请选择交易日期' }]}>
+              <Form.Item name="trade_date" label={ipoTradeDateLabel[ipoTradeModal.tradeType]} rules={[{ required: true, message: '请选择日期' }]}>
                 <DatePicker style={{ width: '100%' }} format="YYYY-MM-DD" />
               </Form.Item>
             </Col>
           </Row>
-          <Row gutter={12}>
-            <Col span={8}>
-              <Form.Item name="shares" label="份额" rules={[{ required: true, message: '请输入份额' }]}>
-                <InputNumber style={{ width: '100%' }} min={0.0001} step={1} />
-              </Form.Item>
-            </Col>
-            <Col span={8}>
-              <Form.Item name="price" label={`成交价 (${ipoTradeModal.item?.currency || 'CNY'})`} rules={[{ required: true, message: '请输入成交价' }]}>
-                <InputNumber style={{ width: '100%' }} min={0.0001} step={0.001} />
-              </Form.Item>
-            </Col>
-            <Col span={8}>
-              <Form.Item name="fee" label="手续费">
-                <InputNumber style={{ width: '100%' }} min={0} step={0.01} />
-              </Form.Item>
-            </Col>
-          </Row>
+          {ipoTradeModal.tradeType !== 'NO_WIN' ? (
+            <Row gutter={12}>
+              <Col span={8}>
+                <Form.Item
+                  name="shares"
+                  label={ipoTradeModal.tradeType === 'SUBSCRIBE' ? '中签股数' : ipoTradeModal.tradeType === 'APPLY' ? '申购股数' : '份额'}
+                  rules={[{ required: true, message: '请输入份额' }]}
+                >
+                  <InputNumber style={{ width: '100%' }} min={0.0001} step={1} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="price" label={`${ipoTradePriceLabel[ipoTradeModal.tradeType]} (${ipoTradeModal.item?.currency || 'CNY'})`} rules={[{ required: true, message: '请输入价格' }]}>
+                  <InputNumber style={{ width: '100%' }} min={0.0001} step={0.001} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="fee" label="手续费">
+                  <InputNumber style={{ width: '100%' }} min={0} step={0.01} />
+                </Form.Item>
+              </Col>
+            </Row>
+          ) : null}
+          {ipoTradeModal.tradeType === 'APPLY' ? (
+            <Form.Item name="follow_up_date" label="回访日期" rules={[{ required: true, message: '请选择回访日期' }]}>
+              <DatePicker style={{ width: '100%' }} format="YYYY-MM-DD" />
+            </Form.Item>
+          ) : null}
           {ipoTradeModal.item ? (
             <div style={{ padding: 10, borderRadius: 8, background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)', marginBottom: 12 }}>
-              <Text style={{ color: '#c9a84c', fontSize: 12, display: 'block', marginBottom: 4 }}>AI 卖出计划</Text>
-              <Text style={{ color: '#b0aea8', fontSize: 12, lineHeight: 1.7, display: 'block' }}>{ipoTradeModal.item.sell_timing || '-'}</Text>
-              <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止盈：{ipoTradeModal.item.take_profit || '-'}</Text>
-              <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止损：{ipoTradeModal.item.stop_loss || '-'}</Text>
+              <Text style={{ color: '#c9a84c', fontSize: 12, display: 'block', marginBottom: 4 }}>
+                {ipoTradeModal.tradeType === 'APPLY'
+                  ? '回访安排'
+                  : ipoTradeModal.tradeType === 'SELL'
+                    ? 'AI 卖出计划'
+                    : '回访确认'}
+              </Text>
+              {ipoTradeModal.tradeType === 'APPLY' ? (
+                <Text style={{ color: '#b0aea8', fontSize: 12, lineHeight: 1.7, display: 'block' }}>
+                  申购后不会直接计入持仓；到回访日期再确认是否中签及实际中签股数。
+                </Text>
+              ) : ipoTradeModal.tradeType === 'SELL' ? (
+                <>
+                  <Text style={{ color: '#b0aea8', fontSize: 12, lineHeight: 1.7, display: 'block' }}>{ipoTradeModal.item.sell_timing || '-'}</Text>
+                  <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止盈：{ipoTradeModal.item.take_profit || '-'}</Text>
+                  <Text style={{ color: '#8f8a82', fontSize: 11, lineHeight: 1.6, display: 'block' }}>止损：{ipoTradeModal.item.stop_loss || '-'}</Text>
+                </>
+              ) : (
+                <Text style={{ color: '#b0aea8', fontSize: 12, lineHeight: 1.7, display: 'block' }}>
+                  {ipoTradeModal.tradeType === 'SUBSCRIBE'
+                    ? '根据申购结束后的回访结果，记录实际中签股数和成本价；确认后才会进入可卖持仓。'
+                    : '确认未中签后只记录回访结果，不会生成持仓或可卖份额。'}
+                </Text>
+              )}
             </div>
           ) : null}
           <Form.Item name="note" label="备注">

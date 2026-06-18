@@ -228,10 +228,11 @@ class IPOTradeCreate(BaseModel):
     platform: str = ""
     currency: str = "CNY"
     trade_type: str
-    shares: float = Field(..., gt=0)
-    price: float = Field(..., gt=0)
+    shares: float = Field(..., ge=0)
+    price: float = Field(..., ge=0)
     fee: float = 0.0
     trade_date: str = ""
+    follow_up_date: str = ""
     analysis_snapshot: dict = {}
     advice_snapshot: dict = {}
     note: str = ""
@@ -245,8 +246,12 @@ class IPOTradeCreate(BaseModel):
     @classmethod
     def normalize_trade_type(cls, value):
         raw = str(value or "").strip().upper()
-        if raw in {"BUY", "APPLY", "申购"}:
+        if raw in {"APPLY", "申购", "已申购", "申购待回访"}:
+            return "APPLY"
+        if raw in {"SUBSCRIBE", "BUY", "WIN", "中签", "确认中签"}:
             return "SUBSCRIBE"
+        if raw in {"NO_WIN", "NOT_WIN", "MISS", "未中签", "不中签"}:
+            return "NO_WIN"
         if raw in {"SELL", "卖出"}:
             return "SELL"
         return raw
@@ -265,6 +270,7 @@ class IPOTradeResponse(BaseModel):
     price: float
     fee: float
     trade_date: str
+    follow_up_date: str = ""
     realized_pnl: float
     analysis_snapshot: dict = {}
     advice_snapshot: dict = {}

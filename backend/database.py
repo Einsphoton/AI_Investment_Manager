@@ -48,6 +48,7 @@ def _migrate():
             ("price", "FLOAT DEFAULT 0"),
             ("fee", "FLOAT DEFAULT 0"),
             ("trade_date", "VARCHAR(20) DEFAULT ''"),
+            ("follow_up_date", "VARCHAR(20) DEFAULT ''"),
             ("realized_pnl", "FLOAT DEFAULT 0"),
             ("analysis_snapshot_json", "TEXT DEFAULT '{}'"),
             ("advice_snapshot_json", "TEXT DEFAULT '{}'"),

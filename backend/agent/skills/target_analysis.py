@@ -100,6 +100,7 @@ class TargetAnalysisSkill(Skill):
 - 对“推荐新标的”，上表没有实时基本面数据时，不得写具体 PE、PB、股息率、分红率、营收增速、ROE 等数字；只能写“需以后端实时数据验证”或使用不含数字的定性描述。
 - 不得使用训练记忆或常识补全财务数字；缺失字段必须写“暂无实时数据”，不要估算。
 - 推荐新标的时，market 只能使用 A/HK/US；asset_type 只能使用 stock/onshore_fund/offshore_fund。
+- 推荐新标的时，如能给出目标价，请在 target_price 写纯数字；如依据不足请写 null，不要把百分比或文字放进该字段。
 - 即使当前关注标的为空，也必须基于宏观环境和允许范围推荐 3-5 个新标的。
 
 返回 JSON 格式（请确保返回的 JSON 严格符合以下结构）：
@@ -129,6 +130,7 @@ class TargetAnalysisSkill(Skill):
       "asset_type": "stock/offshore_fund/onshore_fund",
       "reason": "推荐理由（50字内）",
       "expected_return": "预期收益区间",
+      "target_price": 123.45,
       "risk_level": "LOW/MEDIUM/HIGH",
       "priority": "HIGH/MEDIUM/LOW",
       "analysis": {{

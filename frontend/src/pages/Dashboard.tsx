@@ -392,6 +392,7 @@ export default function Dashboard() {
                 // User cancelled - skip fallback
                 if (e.isCancelled) throw e
                 console.warn('SSE stream for targets failed, falling back to regular API', e)
+                aiCtx.addLog(`⚠️ 标的流式分析中断，正在重试：${getErrorDetail(e)}`, 'warning', '标的分析')
                 try {
                   const fb = await targetsApi.aiAnalyze()
                   if (fb && (fb.report?.target_analysis?.new_recommendations || []).length === 0) {
@@ -520,7 +521,11 @@ export default function Dashboard() {
             await targetsApi.aiAnalyze()
             aiCtx.addLog('✅ AI 推荐标的完成', 'success')
           } catch (e: any) {
-            aiCtx.addLog(`❌ 标的分析失败`, 'error')
+            aiCtx.addLog(`❌ 标的分析失败: ${getErrorDetail(e)}`, 'error', '标的分析')
+            message.error({
+              content: `标的分析失败：${getErrorDetail(e)}`,
+              duration: 6,
+            })
           }
         }
 

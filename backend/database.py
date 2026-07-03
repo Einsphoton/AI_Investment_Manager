@@ -23,10 +23,16 @@ def get_db():
 def _migrate():
     """Add columns missing in existing DB (SQLite's create_all doesn't alter)."""
     from sqlalchemy import inspect, text
+    import json
+    import re
     inspector = inspect(engine)
     for table, col_defs in [
         ("analysis_records", [("asset_id", "INTEGER REFERENCES assets(id)")]),
         ("assets", [("source", "VARCHAR(20) DEFAULT 'manual'")]),
+        ("targets", [
+            ("target_price", "FLOAT DEFAULT NULL"),
+            ("recommended_price", "FLOAT DEFAULT NULL"),
+        ]),
         ("ipo_analysis_records", [
             ("markets", "VARCHAR(50) DEFAULT ''"),
             ("items_json", "TEXT DEFAULT '[]'"),
@@ -64,6 +70,63 @@ def _migrate():
                 with engine.connect() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
                     conn.commit()
+
+    def coerce_float(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except ValueError:
+            return None
+
+    if inspector.has_table("targets"):
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT id, ai_analysis FROM targets "
+                "WHERE (target_price IS NULL OR recommended_price IS NULL) "
+                "AND ai_analysis IS NOT NULL AND ai_analysis != ''"
+            )).mappings().all()
+            for row in rows:
+                try:
+                    payload = json.loads(row["ai_analysis"])
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                target_price = None
+                for key in ("target_price", "price_target", "fair_value", "take_profit_price"):
+                    target_price = coerce_float(payload.get(key))
+                    if target_price is not None:
+                        break
+                recommended_price = None
+                for key in ("recommended_price", "recommend_price", "entry_price", "reference_price"):
+                    recommended_price = coerce_float(payload.get(key))
+                    if recommended_price is not None:
+                        break
+                market_data = payload.get("market_data") if isinstance(payload.get("market_data"), dict) else {}
+                quote = market_data.get("quote") if isinstance(market_data.get("quote"), dict) else {}
+                if recommended_price is None:
+                    recommended_price = coerce_float(quote.get("current_price"))
+                if target_price is None and recommended_price is None:
+                    continue
+                conn.execute(
+                    text(
+                        "UPDATE targets SET "
+                        "target_price = COALESCE(target_price, :target_price), "
+                        "recommended_price = COALESCE(recommended_price, :recommended_price) "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "id": row["id"],
+                        "target_price": target_price,
+                        "recommended_price": recommended_price,
+                    },
+                )
 
 
 def init_db():

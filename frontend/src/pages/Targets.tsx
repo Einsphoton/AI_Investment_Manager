@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAIWorkContext } from '../stores/AIWorkContext'
 import {
-  Card, Table, Button, Modal, Form, Input, Select, Space,
+  Card, Table, Button, Modal, Form, Input, InputNumber, Select, Space,
   Tag, message, Row, Col, Typography, Tooltip, Popconfirm, Popover,
   Radio, Spin
 } from 'antd'
@@ -71,6 +71,48 @@ const assetTypeMap: Record<string, string> = {
 }
 
 const marketColors: Record<string, string> = { A: '#c9a84c', HK: '#e8d48b', US: '#a0893c' }
+const marketCurrency: Record<string, string> = { A: '¥', HK: 'HK$', US: '$' }
+
+const toOptionalNumber = (value: unknown): number | null => {
+  if (value == null || value === '') return null
+  const num = typeof value === 'number' ? value : Number(String(value).replace(/,/g, '').match(/-?\d+(\.\d+)?/)?.[0])
+  return Number.isFinite(num) ? num : null
+}
+
+const parseTargetAnalysis = (target: Target): Record<string, any> => {
+  try {
+    const parsed = JSON.parse(target.ai_analysis || '{}')
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+const targetPriceInfo = (target: Target) => {
+  const parsed = parseTargetAnalysis(target)
+  const targetPrice = (
+    toOptionalNumber(target.target_price) ??
+    toOptionalNumber(parsed.target_price) ??
+    toOptionalNumber(parsed.price_target) ??
+    toOptionalNumber(parsed.fair_value) ??
+    toOptionalNumber(parsed.take_profit_price)
+  )
+  if (targetPrice != null) {
+    return { value: targetPrice, label: 'AI 目标价' }
+  }
+
+  const recommendedPrice = (
+    toOptionalNumber(target.recommended_price) ??
+    toOptionalNumber(parsed.recommended_price) ??
+    toOptionalNumber(parsed.recommend_price) ??
+    toOptionalNumber(parsed.entry_price) ??
+    toOptionalNumber(parsed.market_data?.quote?.current_price)
+  )
+  if (recommendedPrice != null) {
+    return { value: recommendedPrice, label: '推荐时参考价' }
+  }
+  return { value: null, label: '' }
+}
 
 const chartCache = new Map<string, MarketHistoryItem[]>()
 const chartRequestCache = new Map<string, Promise<MarketHistoryItem[]>>()
@@ -648,7 +690,10 @@ export default function Targets() {
     try {
       aiCtx.addLog('正在实时分析标的...', 'info')
       try {
-        const result = await aiCtx.streamSSE('/api/targets/ai-analyze-stream')
+        const result = await aiCtx.streamSSE('/api/targets/ai-analyze-stream', {
+          markets: marketFilter,
+          asset_types: assetTypeFilter,
+        })
         await fetchTargets()
         await fetchRecommendationStats()
         if (result && result.summary) {
@@ -683,7 +728,7 @@ export default function Targets() {
       }
       aiCtx.completeTask()
     } catch (e: any) {
-      aiCtx.failTask(e?.response?.data?.detail || '分析失败')
+      aiCtx.failTask(e?.response?.data?.detail || e?.message || '分析失败')
     }
   }
 
@@ -740,16 +785,34 @@ export default function Targets() {
       },
     },
     {
+      title: '目标价', key: 'target_price', width: 95,
+      render: (_: any, r: Target) => {
+        const info = targetPriceInfo(r)
+        if (info.value == null) return <span style={{ color: '#5c5a55', fontSize: 11 }}>-</span>
+        const currency = marketCurrency[r.market] || '¥'
+        return (
+          <Tooltip title={info.label}>
+            <span style={{ color: info.label === 'AI 目标价' ? '#c9a84c' : '#9a9892', fontWeight: 600, fontSize: 12, whiteSpace: 'nowrap' }}>
+              {currency}{info.value.toFixed(2)}
+            </span>
+          </Tooltip>
+        )
+      },
+    },
+    {
       title: '推荐后涨跌', key: 'change', width: 100,
       render: (_: any, r: Target) => {
         const price = prices[r.id]
-        let recPrice: number | null = null
-        try { recPrice = JSON.parse(r.ai_analysis)?.recommended_price } catch {}
+        const recPrice = (
+          toOptionalNumber(r.recommended_price) ??
+          toOptionalNumber(parseTargetAnalysis(r).recommended_price)
+        )
         if (recPrice != null && price) {
           const change = ((price.current - recPrice) / recPrice * 100)
           const isPositive = change >= 0
+          const currency = marketCurrency[r.market] || '¥'
           return (
-            <Tooltip title={`推荐时 ¥${recPrice.toFixed(2)} → 当前 ¥${price.current.toFixed(2)}`}>
+            <Tooltip title={`推荐时 ${currency}${recPrice.toFixed(2)} → 当前 ${currency}${price.current.toFixed(2)}`}>
               <span style={{ color: isPositive ? '#3f8600' : '#cf1322', fontWeight: 600, fontSize: 12, whiteSpace: 'nowrap' }}>
                 {isPositive ? '+' : ''}{change.toFixed(2)}%
               </span>
@@ -822,7 +885,7 @@ export default function Targets() {
           columns={columns}
           rowKey="id"
           loading={loading}
-          scroll={{ x: 800 }}
+          scroll={{ x: 900 }}
           pagination={{ pageSize: 20, showSizeChanger: true, showTotal: t => `共 ${t} 个标的` }}
         />
       )
@@ -844,7 +907,7 @@ export default function Targets() {
           columns={columns}
           rowKey="id"
           loading={loading}
-          scroll={{ x: 800 }}
+          scroll={{ x: 900 }}
           pagination={false}
         />
       </div>
@@ -1053,6 +1116,9 @@ export default function Targets() {
               </Form.Item>
             </Col>
           </Row>
+          <Form.Item name="target_price" label="目标价">
+            <InputNumber style={{ width: '100%' }} min={0} precision={4} placeholder="可选，用于列表参考" />
+          </Form.Item>
           <Form.Item name="reason" label="关注理由">
             <Input.TextArea rows={2} placeholder="为什么关注这个标的？" />
           </Form.Item>

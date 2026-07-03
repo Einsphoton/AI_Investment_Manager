@@ -151,6 +151,8 @@ export interface Target {
   priority: string
   risk_level: string
   expected_return: string
+  target_price: number | null
+  recommended_price: number | null
   status: string
   note: string
   ai_analysis: string

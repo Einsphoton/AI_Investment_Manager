@@ -83,6 +83,8 @@ class Target(Base):
     priority = Column(String(10), default="MEDIUM")  # HIGH, MEDIUM, LOW
     risk_level = Column(String(10), default="MEDIUM")
     expected_return = Column(String(50), default="")
+    target_price = Column(Float, default=None, nullable=True)
+    recommended_price = Column(Float, default=None, nullable=True)
     status = Column(String(20), default="active")  # active, removed
     note = Column(Text, default="")
     ai_analysis = Column(Text, default="")

@@ -148,6 +148,8 @@ class TargetCreate(BaseModel):
     priority: str = "MEDIUM"
     risk_level: str = "MEDIUM"
     expected_return: str = ""
+    target_price: Optional[float] = None
+    recommended_price: Optional[float] = None
     note: str = ""
 
 
@@ -161,6 +163,8 @@ class TargetUpdate(BaseModel):
     priority: Optional[str] = None
     risk_level: Optional[str] = None
     expected_return: Optional[str] = None
+    target_price: Optional[float] = None
+    recommended_price: Optional[float] = None
     status: Optional[str] = None
     note: Optional[str] = None
 
@@ -176,6 +180,8 @@ class TargetResponse(BaseModel):
     priority: str
     risk_level: str
     expected_return: str
+    target_price: Optional[float] = None
+    recommended_price: Optional[float] = None
     status: str
     note: str
     ai_analysis: str

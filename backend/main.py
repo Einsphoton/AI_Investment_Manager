@@ -343,6 +343,7 @@ def _run_scheduled_target_analysis(db: Session):
                 existing.expected_return = str(rec.get("expected_return") or existing.expected_return or "")
                 existing.risk_level = str(rec.get("risk_level") or existing.risk_level or "MEDIUM")
                 existing.status = "active"
+                _apply_target_prices(existing, rec)
                 try:
                     existing.ai_analysis = json.dumps(rec, ensure_ascii=False, default=str)
                 except Exception:
@@ -358,6 +359,7 @@ def _run_scheduled_target_analysis(db: Session):
                     pass
                 if rec_price is not None:
                     rec["recommended_price"] = rec_price
+                target_price, recommended_price = _target_price_fields(rec)
                 db.add(Target(
                     code=code,
                     name=str(rec.get("name") or code),
@@ -368,6 +370,8 @@ def _run_scheduled_target_analysis(db: Session):
                     priority=str(rec.get("priority") or "MEDIUM"),
                     risk_level=str(rec.get("risk_level") or "MEDIUM"),
                     expected_return=str(rec.get("expected_return") or ""),
+                    target_price=target_price,
+                    recommended_price=recommended_price,
                     status="active",
                     ai_analysis=json.dumps(rec, ensure_ascii=False, default=str),
                 ))
@@ -393,6 +397,7 @@ def _run_scheduled_target_analysis(db: Session):
                     rec_price = price_map.get(t.code)
                     if rec_price is not None:
                         item["recommended_price"] = rec_price
+                    _apply_target_prices(t, item)
                     try:
                         t.ai_analysis = json.dumps(item, ensure_ascii=False, default=str)
                     except Exception:
@@ -584,7 +589,11 @@ def _run_stream_job(job_id: str, url: str, body: dict | None = None) -> None:
         if url == "/api/analysis/run-stream":
             generator = stream_portfolio_analysis(db)
         elif url == "/api/targets/ai-analyze-stream":
-            generator = stream_target_analysis(db)
+            generator = stream_target_analysis(
+                db,
+                markets=body.get("markets") or None,
+                asset_types=body.get("asset_types") or None,
+            )
         elif url == "/api/investment-advice/run-stream":
             generator = stream_investment_advice(db, asset_scope=str(body.get("asset_scope") or "all"))
         else:
@@ -831,6 +840,51 @@ def _normalize_ai_number(value, default=0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_optional_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text or text.lower() in {"null", "none", "nan", "-"}:
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _target_price_fields(payload: dict) -> tuple[float | None, float | None]:
+    target_price = None
+    recommended_price = None
+    for key in ("target_price", "price_target", "fair_value", "take_profit_price"):
+        target_price = _coerce_optional_float(payload.get(key))
+        if target_price is not None:
+            break
+    for key in ("recommended_price", "recommend_price", "entry_price", "reference_price"):
+        recommended_price = _coerce_optional_float(payload.get(key))
+        if recommended_price is not None:
+            break
+    market_data = payload.get("market_data") if isinstance(payload.get("market_data"), dict) else {}
+    quote = market_data.get("quote") if isinstance(market_data.get("quote"), dict) else {}
+    if recommended_price is None:
+        recommended_price = _coerce_optional_float(quote.get("current_price"))
+    return target_price, recommended_price
+
+
+def _apply_target_prices(db_target: Target, payload: dict) -> None:
+    target_price, recommended_price = _target_price_fields(payload)
+    if target_price is not None:
+        db_target.target_price = target_price
+        payload["target_price"] = target_price
+    if recommended_price is not None:
+        db_target.recommended_price = recommended_price
+        payload["recommended_price"] = recommended_price
 
 
 def _analysis_code_key(code: str) -> str:
@@ -3710,6 +3764,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                 existing.expected_return = safe_str(rec.get("expected_return"), existing.expected_return or "")
                 existing.risk_level = safe_str(rec.get("risk_level"), existing.risk_level or "MEDIUM")
                 existing.status = "active"
+                _apply_target_prices(existing, rec)
                 try:
                     existing.ai_analysis = json.dumps(rec, ensure_ascii=False, default=str)
                 except Exception:
@@ -3717,6 +3772,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
             else:
                 _added_count += 1
                 filter_diagnostics["added_count"] = _added_count
+                target_price, recommended_price = _target_price_fields(rec)
                 db.add(Target(
                     code=code,
                     name=safe_str(rec.get("name")) or code,
@@ -3727,6 +3783,8 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                     priority=safe_str(rec.get("priority")) or "MEDIUM",
                     risk_level=safe_str(rec.get("risk_level")) or "MEDIUM",
                     expected_return=safe_str(rec.get("expected_return")),
+                    target_price=target_price,
+                    recommended_price=recommended_price,
                     status="active",
                     ai_analysis=json.dumps(rec, ensure_ascii=False, default=str),
                 ))
@@ -3750,6 +3808,7 @@ def ai_analyze_targets(req: Optional[AIRecommendConfig] = None, db: Session = De
                     if fundamentals_map.get(t.code):
                         item["market_data"] = item.get("market_data") or {}
                         item["market_data"]["fundamentals"] = fundamentals_map[t.code]
+                    _apply_target_prices(t, item)
                     try:
                         t.ai_analysis = json.dumps(item, ensure_ascii=False, default=str)
                     except Exception:
